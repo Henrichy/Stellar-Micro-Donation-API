@@ -34,7 +34,8 @@ class Wallet {
     const newWallet = {
       id: Date.now().toString(),
       address: walletData.address,
-      name: walletData.name,
+      label: walletData.label || null,
+      ownerName: walletData.ownerName || null,
       active: true,
       createdAt: new Date().toISOString(),
       deactivatedAt: null,
@@ -57,6 +58,20 @@ class Wallet {
   static getByAddress(address) {
     const wallets = this.loadWallets();
     return wallets.find(w => w.address === address);
+  }
+
+  static update(id, updates) {
+    const wallets = this.loadWallets();
+    const index = wallets.findIndex(w => w.id === id);
+    if (index === -1) return null;
+    
+    wallets[index] = {
+      ...wallets[index],
+      ...updates,
+      updatedAt: new Date().toISOString()
+    };
+    this.saveWallets(wallets);
+    return wallets[index];
   }
 
   static getActive() {
