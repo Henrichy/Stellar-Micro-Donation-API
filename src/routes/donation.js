@@ -133,4 +133,50 @@ router.get('/:id', (req, res) => {
   }
 });
 
+/**
+ * PATCH /donations/:id/status
+ * Update donation transaction status
+ */
+router.patch('/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, stellarTxId, ledger } = req.body;
+
+    if (!status) {
+      return res.status(400).json({
+        error: 'Missing required field: status'
+      });
+    }
+
+    const validStatuses = ['pending', 'confirmed', 'failed', 'cancelled'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        error: `Invalid status. Must be one of: ${validStatuses.join(', ')}`
+      });
+    }
+
+    const stellarData = {};
+    if (stellarTxId) stellarData.transactionId = stellarTxId;
+    if (ledger) stellarData.ledger = ledger;
+    if (status === 'confirmed') stellarData.confirmedAt = new Date().toISOString();
+
+    const updatedTransaction = Transaction.updateStatus(id, status, stellarData);
+
+    res.json({
+      success: true,
+      data: updatedTransaction
+    });
+  } catch (error) {
+    if (error.message.includes('not found')) {
+      return res.status(404).json({
+        error: error.message
+      });
+    }
+    res.status(500).json({
+      error: 'Failed to update transaction status',
+      message: error.message
+    });
+  }
+});
+
 module.exports = router;

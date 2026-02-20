@@ -139,7 +139,8 @@ class MockStellarService {
       memo,
       timestamp: new Date().toISOString(),
       ledger: Math.floor(Math.random() * 1000000) + 1000000,
-      status: 'success',
+      status: 'confirmed',
+      confirmedAt: new Date().toISOString(),
     };
 
     // Store transaction for both accounts
@@ -160,6 +161,8 @@ class MockStellarService {
     return {
       transactionId: transaction.transactionId,
       ledger: transaction.ledger,
+      status: transaction.status,
+      confirmedAt: transaction.confirmedAt,
     };
   }
 
@@ -178,6 +181,37 @@ class MockStellarService {
 
     const transactions = this.transactions.get(publicKey) || [];
     return transactions.slice(-limit).reverse();
+  }
+
+  /**
+   * Verify a mock transaction by hash
+   * @param {string} transactionHash - Transaction hash to verify
+   * @returns {Promise<{verified: boolean, transaction: Object}>}
+   */
+  async verifyTransaction(transactionHash) {
+    // Search all transactions for the given hash
+    for (const txList of this.transactions.values()) {
+      const transaction = txList.find(tx => tx.transactionId === transactionHash);
+      if (transaction) {
+        return {
+          verified: true,
+          status: transaction.status,
+          transaction: {
+            id: transaction.transactionId,
+            source: transaction.source,
+            destination: transaction.destination,
+            amount: transaction.amount,
+            memo: transaction.memo,
+            timestamp: transaction.timestamp,
+            ledger: transaction.ledger,
+            status: transaction.status,
+            confirmedAt: transaction.confirmedAt,
+          },
+        };
+      }
+    }
+
+    throw new Error(`Transaction not found: ${transactionHash}`);
   }
 
   /**
