@@ -60,6 +60,15 @@ router.post('/', (req, res) => {
       });
     }
 
+    const normalizedDonor = typeof donor === 'string' ? donor.trim() : '';
+    const normalizedRecipient = typeof recipient === 'string' ? recipient.trim() : '';
+
+    if (normalizedDonor && normalizedRecipient && normalizedDonor === normalizedRecipient) {
+      return res.status(400).json({
+        error: 'Sender and recipient wallets must be different'
+      });
+    }
+
     const transaction = Transaction.create({
       amount: parseFloat(amount),
       donor: donor || 'Anonymous',

@@ -110,6 +110,10 @@ class MockStellarService {
       throw new Error('Invalid source secret key');
     }
 
+    if (sourceWallet.publicKey === destinationPublic) {
+      throw new Error('Sender and recipient wallets must be different');
+    }
+
     const destWallet = this.wallets.get(destinationPublic);
     if (!destWallet) {
       throw new Error(`Destination wallet not found: ${destinationPublic}`);
