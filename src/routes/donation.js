@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const Transaction = require('./models/transaction');
+const Wallet = require('./models/wallet');
 
 /**
  * POST /donations
@@ -20,6 +21,16 @@ router.post('/', (req, res) => {
       return res.status(400).json({
         error: 'Amount must be a positive number'
       });
+    }
+
+    // Check if donor wallet is active (if donor is specified)
+    if (donor && donor !== 'Anonymous') {
+      const donorWallet = Wallet.getByAddress(donor);
+      if (donorWallet && !donorWallet.active) {
+        return res.status(403).json({
+          error: 'Donor wallet is inactive and cannot send donations'
+        });
+      }
     }
 
     const transaction = Transaction.create({
