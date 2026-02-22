@@ -1,10 +1,11 @@
+const { UnauthorizedError, ForbiddenError } = require('../utils/errors');
 const { getPermissionsByRole } = require('../models/permissions');
 
 exports.checkPermission = (permission) => {
   return (req, res, next) => {
     
     if (!req.user) {
-      return res.status(401).json({ error: "Unauthorized" });
+      throw new UnauthorizedError();
     }
 
     const userRole = req.user.role;
@@ -12,7 +13,7 @@ exports.checkPermission = (permission) => {
 
     
     if (!userPermissions.includes(permission)) {
-      return res.status(403).json({ error: "Access denied" });
+      throw new ForbiddenError('Insufficient permissions for this action');
     }
 
     next();

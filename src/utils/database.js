@@ -1,5 +1,6 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const { DatabaseError } = require('./errors');
 
 const DB_PATH = path.join(__dirname, '../../data/stellar_donations.db');
 
@@ -8,7 +9,7 @@ class Database {
     return new Promise((resolve, reject) => {
       const db = new sqlite3.Database(DB_PATH, (err) => {
         if (err) {
-          reject(err);
+          reject(new DatabaseError('Failed to connect to database', err));
         } else {
           resolve(db);
         }
@@ -22,7 +23,7 @@ class Database {
       db.all(sql, params, (err, rows) => {
         db.close();
         if (err) {
-          reject(err);
+          reject(new DatabaseError('Database query failed', err));
         } else {
           resolve(rows);
         }
@@ -36,7 +37,7 @@ class Database {
       db.run(sql, params, function(err) {
         db.close();
         if (err) {
-          reject(err);
+          reject(new DatabaseError('Database operation failed', err));
         } else {
           resolve({ id: this.lastID, changes: this.changes });
         }
@@ -50,7 +51,7 @@ class Database {
       db.get(sql, params, (err, row) => {
         db.close();
         if (err) {
-          reject(err);
+          reject(new DatabaseError('Database query failed', err));
         } else {
           resolve(row);
         }

@@ -148,7 +148,7 @@ class MockStellarService {
       }
 
       if (sourceWallet.publicKey === destinationPublic) {
-        throw new Error('Sender and recipient wallets must be different');
+        throw new ValidationError('Sender and recipient wallets must be different');
       }
 
       let destWallet = this.wallets.get(destinationPublic);
@@ -165,7 +165,8 @@ class MockStellarService {
       // Check if destination account is funded (Stellar requirement)
       const destBalance = parseFloat(destWallet.balance);
       if (destBalance === 0) {
-        throw new Error(
+        throw new BusinessLogicError(
+          ERROR_CODES.TRANSACTION_FAILED,
           'Destination account is not funded. On Stellar, accounts must be funded with at least 1 XLM before they can receive payments. ' +
           'Please fund the account first using the Friendbot (testnet) or send an initial funding transaction.'
         );
@@ -282,7 +283,7 @@ class MockStellarService {
     const wallet = this.wallets.get(publicKey);
 
     if (!wallet) {
-      throw new Error(`Wallet not found: ${publicKey}`);
+      throw new NotFoundError(`Wallet not found: ${publicKey}`, ERROR_CODES.WALLET_NOT_FOUND);
     }
 
     if (!this.streamListeners.has(publicKey)) {

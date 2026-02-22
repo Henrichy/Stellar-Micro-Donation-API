@@ -5,6 +5,7 @@ const walletRoutes = require('./wallet');
 const statsRoutes = require('./stats');
 const streamRoutes = require('./stream');
 const recurringDonationScheduler = require('../services/RecurringDonationScheduler');
+const { errorHandler, notFoundHandler } = require('../middleware/errorHandler');
 const logger = require('../middleware/logger');
 const errorHandler = require('../middleware/errorHandler');
 
@@ -31,14 +32,8 @@ app.get('/health', (req, res) => {
   });
 });
 
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    error: 'Endpoint not found',
-    path: req.path,
-    method: req.method
-  });
-});
+// 404 handler (must be after all routes)
+app.use(notFoundHandler);
 
 // Global error handler
 app.use(errorHandler);
