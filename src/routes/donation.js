@@ -13,8 +13,8 @@ const { calculateAnalyticsFee } = require('../utils/feeCalculator');
 const stellarService = getStellarService();
 
 /**
- * POST /api/v1/donation/verify
- * Verify a donation transaction by hash
+ * POST /donations
+ * Create a new donation
  */
 router.post('/verify', requireApiKey, async (req, res) => {
   try {
@@ -24,11 +24,15 @@ router.post('/verify', requireApiKey, async (req, res) => {
       throw new ValidationError('Transaction hash is required', null, ERROR_CODES.INVALID_REQUEST);
     }
 
-    const result = await stellarService.verifyTransaction(transactionHash);
+    const transaction = Transaction.create({
+      amount: parseFloat(amount),
+      donor: donor || 'Anonymous',
+      recipient
+    });
 
-    res.json({
+    res.status(201).json({
       success: true,
-      data: result
+      data: transaction
     });
   } catch (error) {
     // Handle Stellar errors with proper status codes
@@ -150,9 +154,14 @@ router.post('/send', requireIdempotency, async (req, res) => {
 });
 
 /**
+<<<<<<< feature/idempotency-donations
  * POST /donations
  * Create a new donation
  * Requires idempotency key to prevent duplicate processing
+=======
+ * POST /donations/verify
+ * Verify a donation transaction by hash
+>>>>>>> main
  */
 router.post('/', requireApiKey, requireIdempotency, async (req, res, next) => {
   try {
@@ -255,6 +264,7 @@ router.post('/', requireApiKey, requireIdempotency, async (req, res, next) => {
 
     const response = {
       success: true,
+<<<<<<< feature/idempotency-donations
       data: transaction
     };
 
@@ -267,6 +277,13 @@ router.post('/', requireApiKey, requireIdempotency, async (req, res, next) => {
     }
 
     res.status(201).json(response);
+=======
+      data: {
+        verified: true,
+        transactionHash
+      }
+    });
+>>>>>>> main
   } catch (error) {
     next(error);
   }
