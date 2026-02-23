@@ -1,6 +1,7 @@
 const sqlite3 = require('sqlite3').verbose();
 const fs = require('fs');
 const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 const DATA_DIR = './data';
 const DB_PATH = path.join(DATA_DIR, 'stellar_donations.db');
@@ -31,10 +32,11 @@ function createUsersTable(db) {
       CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         publicKey TEXT NOT NULL UNIQUE,
+        encryptedSecret TEXT,
         createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `;
-    
+
     db.run(createTableSQL, (err) => {
       if (err) {
         reject(err);
@@ -60,12 +62,12 @@ function createTransactionsTable(db) {
         FOREIGN KEY (receiverId) REFERENCES users(id)
       )
     `;
-    
+
     db.run(createTableSQL, (err) => {
       if (err) {
         reject(err);
       } else {
-        console.log('✓ Created transactions table');
+        console.log('✓ Created transactions table (with memo column)');
         resolve();
       }
     });
@@ -73,24 +75,35 @@ function createTransactionsTable(db) {
 }
 
 function insertSampleUsers(db) {
+  const encryption = require('../utils/encryption');
   return new Promise((resolve, reject) => {
     const sampleUsers = [
-      'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJMUC5XNODMZTQYBB5XYZXYUU',
-      'GBBD47UZQ5EYJYJMZXZYDUC77SAZXSQEA7XJJGTAY5XJJGUJMUC5XNOD',
-      'GCZST3XVCDTUJ76ZAV2HA72KYQM4YQQ5DUJTHIGQ5ESE3JNEZUAEUA7X'
+      {
+        publicKey: 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJMUC5XNODMZTQYBB5XYZXYUU',
+        secret: 'SA7XJJGTAY5XJJGUJMUC5XNODMZTQYBB5XYZXYUU7XJJGTAY5XJJGUJMUC'
+      },
+      {
+        publicKey: 'GBBD47UZQ5EYJYJMZXZYDUC77SAZXSQEA7XJJGTAY5XJJGUJMUC5XNOD',
+        secret: 'SBBD47UZQ5EYJYJMZXZYDUC77SAZXSQEA7XJJGTAY5XJJGUJMUC5XNOD'
+      },
+      {
+        publicKey: 'GCZST3XVCDTUJ76ZAV2HA72KYQM4YQQ5DUJTHIGQ5ESE3JNEZUAEUA7X',
+        secret: 'SCZST3XVCDTUJ76ZAV2HA72KYQM4YQQ5DUJTHIGQ5ESE3JNEZUAEUA7X'
+      }
     ];
 
-    const insertSQL = 'INSERT OR IGNORE INTO users (publicKey) VALUES (?)';
+    const insertSQL = 'INSERT OR IGNORE INTO users (publicKey, encryptedSecret) VALUES (?, ?)';
     let completed = 0;
 
-    sampleUsers.forEach((publicKey) => {
-      db.run(insertSQL, [publicKey], (err) => {
+    sampleUsers.forEach((user) => {
+      const encryptedSecret = encryption.encrypt(user.secret);
+      db.run(insertSQL, [user.publicKey, encryptedSecret], (err) => {
         if (err) {
           reject(err);
         } else {
           completed++;
           if (completed === sampleUsers.length) {
-            console.log(`✓ Inserted ${sampleUsers.length} sample users`);
+            console.log(`✓ Inserted ${sampleUsers.length} sample users with encrypted secrets`);
             resolve();
           }
         }
@@ -144,7 +157,7 @@ function verifyTables(db) {
 
 async function main() {
   console.log('Initializing Stellar Micro-Donation API Database...\n');
-  
+
   let db;
   try {
     ensureDataDir();
@@ -154,7 +167,7 @@ async function main() {
     await insertSampleUsers(db);
     await insertSampleTransactions(db);
     await verifyTables(db);
-    
+
     console.log('\n✓ Database initialization complete!');
     console.log(`\nDatabase location: ${DB_PATH}`);
   } catch (error) {

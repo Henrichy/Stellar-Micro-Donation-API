@@ -3,15 +3,16 @@
  * Handles actual blockchain interactions with Stellar network
  */
 
+const StellarSdk = require('stellar-sdk');
+const StellarErrorHandler = require('../utils/stellarErrorHandler');
+
 class StellarService {
   constructor(config = {}) {
     this.network = config.network || 'testnet';
     this.horizonUrl = config.horizonUrl || 'https://horizon-testnet.stellar.org';
     this.serviceSecretKey = config.serviceSecretKey;
-    
-    // TODO: Initialize Stellar SDK when implementing
-    // const StellarSdk = require('stellar-sdk');
-    // this.server = new StellarSdk.Server(this.horizonUrl);
+
+    this.server = new StellarSdk.Horizon.Server(this.horizonUrl);
   }
 
   /**
@@ -19,7 +20,11 @@ class StellarService {
    * @returns {Promise<{publicKey: string, secretKey: string}>}
    */
   async createWallet() {
-    throw new Error('StellarService.createWallet() not yet implemented');
+    const pair = StellarSdk.Keypair.random();
+    return {
+      publicKey: pair.publicKey(),
+      secretKey: pair.secret(),
+    };
   }
 
   /**
@@ -27,8 +32,21 @@ class StellarService {
    * @param {string} publicKey - Stellar public key
    * @returns {Promise<{balance: string, asset: string}>}
    */
+  // eslint-disable-next-line no-unused-vars
   async getBalance(publicKey) {
-    throw new Error('StellarService.getBalance() not yet implemented');
+    try {
+      const account = await this.server.loadAccount(publicKey);
+      const nativeBalance = account.balances.find(b => b.asset_type === 'native');
+      return {
+        balance: nativeBalance ? nativeBalance.balance : '0',
+        asset: 'XLM',
+      };
+    } catch (error) {
+      if (error.response && error.response.status === 404) {
+        return { balance: '0', asset: 'XLM' };
+      }
+      throw error;
+    }
   }
 
   /**
@@ -36,8 +54,15 @@ class StellarService {
    * @param {string} publicKey - Stellar public key
    * @returns {Promise<{balance: string}>}
    */
+  // eslint-disable-next-line no-unused-vars
   async fundTestnetWallet(publicKey) {
-    throw new Error('StellarService.fundTestnetWallet() not yet implemented');
+    try {
+      await this.server.friendbot(publicKey).call();
+      const balance = await this.getBalance(publicKey);
+      return balance;
+    } catch (error) {
+      throw new Error(`Failed to fund wallet: ${error.message}`);
+    }
   }
 
   /**
@@ -45,8 +70,23 @@ class StellarService {
    * @param {string} publicKey - Stellar public key
    * @returns {Promise<{funded: boolean, balance: string, exists: boolean}>}
    */
+  // eslint-disable-next-line no-unused-vars
   async isAccountFunded(publicKey) {
-    throw new Error('StellarService.isAccountFunded() not yet implemented');
+    try {
+      const balance = await this.getBalance(publicKey);
+      const funded = parseFloat(balance.balance) > 0;
+      return {
+        funded,
+        balance: balance.balance,
+        exists: true,
+      };
+    } catch (error) {
+      return {
+        funded: false,
+        balance: '0',
+        exists: false,
+      };
+    }
   }
 
   /**
@@ -55,11 +95,42 @@ class StellarService {
    * @param {string} params.sourceSecret - Source account secret key
    * @param {string} params.destinationPublic - Destination public key
    * @param {string} params.amount - Amount in XLM
-   * @param {string} params.memo - Transaction memo
+   * @param {string} [params.memo] - Optional transaction memo (max 28 bytes)
    * @returns {Promise<{transactionId: string, ledger: number}>}
    */
-  async sendDonation({ sourceSecret, destinationPublic, amount, memo }) {
-    throw new Error('StellarService.sendDonation() not yet implemented');
+  async sendDonation({ sourceSecret, destinationPublic, amount, memo = '' }) {
+    try {
+      const sourceKeypair = StellarSdk.Keypair.fromSecret(sourceSecret);
+      const sourceAccount = await this.server.loadAccount(sourceKeypair.publicKey());
+
+      const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+        fee: StellarSdk.BASE_FEE,
+        networkPassphrase: this.network === 'public' ? StellarSdk.Networks.PUBLIC : StellarSdk.Networks.TESTNET,
+      })
+        .addOperation(StellarSdk.Operation.payment({
+          destination: destinationPublic,
+          asset: StellarSdk.Asset.native(),
+          amount: amount.toString(),
+        }))
+        .setTimeout(30);
+
+      if (memo) {
+        transaction.addMemo(StellarSdk.Memo.text(memo));
+      }
+
+      const builtTx = transaction.build();
+      builtTx.sign(sourceKeypair);
+
+      const result = await this.server.submitTransaction(builtTx);
+      return {
+        transactionId: result.hash,
+        ledger: result.ledger,
+      };
+    } catch (error) {
+      console.error('Stellar transaction error:', error);
+      const message = error.response?.data?.extras?.result_codes?.operations?.[0] || error.message;
+      throw new Error(`Stellar transaction failed: ${message}`);
+    }
   }
 
   /**
@@ -68,8 +139,18 @@ class StellarService {
    * @param {number} limit - Number of transactions to retrieve
    * @returns {Promise<Array>}
    */
+  // eslint-disable-next-line no-unused-vars
   async getTransactionHistory(publicKey, limit = 10) {
-    throw new Error('StellarService.getTransactionHistory() not yet implemented');
+    try {
+      const result = await this.server.transactions()
+        .forAccount(publicKey)
+        .limit(limit)
+        .order('desc')
+        .call();
+      return result.records;
+    } catch (error) {
+      throw new Error(`Failed to fetch transactions: ${error.message}`);
+    }
   }
 
   /**
@@ -78,8 +159,15 @@ class StellarService {
    * @param {Function} onTransaction - Callback for each transaction
    * @returns {Function} Unsubscribe function
    */
+  // eslint-disable-next-line no-unused-vars
   streamTransactions(publicKey, onTransaction) {
-    throw new Error('StellarService.streamTransactions() not yet implemented');
+    return this.server.transactions()
+      .forAccount(publicKey)
+      .cursor('now')
+      .stream({
+        onmessage: (tx) => onTransaction(tx),
+        onerror: (error) => console.error('Stream error:', error),
+      });
   }
 
   /**
@@ -87,8 +175,20 @@ class StellarService {
    * @param {string} transactionHash - Transaction hash to verify
    * @returns {Promise<{verified: boolean, transaction: Object}>}
    */
+  // eslint-disable-next-line no-unused-vars
   async verifyTransaction(transactionHash) {
-    throw new Error('StellarService.verifyTransaction() not yet implemented');
+    try {
+      const tx = await this.server.transaction(transactionHash).call();
+      return {
+        verified: true,
+        transaction: tx,
+      };
+    } catch (error) {
+      return {
+        verified: false,
+        error: error.message,
+      };
+    }
   }
 }
 

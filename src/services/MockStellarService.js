@@ -26,6 +26,7 @@
 
 const crypto = require('crypto');
 const { NotFoundError, ValidationError, BusinessLogicError, ERROR_CODES } = require('../utils/errors');
+const StellarErrorHandler = require('../utils/stellarErrorHandler');
 
 class MockStellarService {
   constructor(config = {}) {

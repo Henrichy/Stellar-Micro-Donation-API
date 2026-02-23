@@ -6,17 +6,16 @@ const statsRoutes = require('./stats');
 const streamRoutes = require('./stream');
 const recurringDonationScheduler = require('../services/RecurringDonationScheduler');
 const { errorHandler, notFoundHandler } = require('../middleware/errorHandler');
+const logger = require('../middleware/logger');
+const errorHandler = require('../middleware/errorHandler');
 
 const app = express();
 
 // Middleware
 app.use(express.json());
 
-// Request logging middleware
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-  next();
-});
+// Request/Response logging middleware
+app.use(logger.middleware());
 
 // Routes
 app.use('/donations', donationRoutes);
@@ -36,15 +35,24 @@ app.get('/health', (req, res) => {
 // 404 handler (must be after all routes)
 app.use(notFoundHandler);
 
-// Global error handler (must be last)
+// Global error handler
 app.use(errorHandler);
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[UnhandledRejection]', {
+    reason,
+    promise,
+    timestamp: new Date().toISOString()
+  });
+});
 
 const PORT = config.port;
 app.listen(PORT, () => {
   console.log(`Stellar Micro-Donation API running on port ${PORT}`);
   console.log(`Network: ${config.network}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
-  
+
   // Start the recurring donation scheduler
   recurringDonationScheduler.start();
 });

@@ -1,20 +1,24 @@
 const express = require('express');
 const router = express.Router();
-const StellarService = require('../services/StellarService');
+const Database = require('../utils/database');
 const Transaction = require('./models/transaction');
-const Wallet = require('./models/wallet');
-const { ValidationError, NotFoundError, InternalError, ERROR_CODES } = require('../utils/errors');
+const requireApiKey = require('../middleware/apiKeyMiddleware');
 
 const stellarService = new StellarService({
   network: process.env.STELLAR_NETWORK || 'testnet',
   horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org'
 });
+const donationValidator = require('../utils/donationValidator');
+const memoValidator = require('../utils/memoValidator');
+const { calculateAnalyticsFee } = require('../utils/feeCalculator');
+
+const stellarService = getStellarService();
 
 /**
  * POST /api/v1/donation/verify
  * Verify a donation transaction by hash
  */
-router.post('/verify', async (req, res, next) => {
+router.post('/verify', requireApiKey, async (req, res) => {
   try {
     const { transactionHash } = req.body;
 
@@ -29,7 +33,108 @@ router.post('/verify', async (req, res, next) => {
       data: result
     });
   } catch (error) {
-    next(error);
+    // Handle Stellar errors with proper status codes
+    const status = error.status || 500;
+    const code = error.code || 'VERIFICATION_FAILED';
+    const message = error.message || 'Failed to verify transaction';
+
+    res.status(status).json({
+      success: false,
+      error: {
+        code,
+        message
+      }
+    });
+  }
+});
+
+
+/**
+ * POST /donations/send
+ * Send XLM from one wallet to another and record it
+ */
+router.post('/send', async (req, res) => {
+  try {
+    const { senderId, receiverId, amount, memo } = req.body;
+
+    // 1. Validation
+    if (!senderId || !receiverId || !amount) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: senderId, receiverId, amount'
+      });
+    }
+
+    if (isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Amount must be a positive number'
+      });
+    }
+
+    // 2. Database Lookup
+    const sender = await Database.get('SELECT * FROM users WHERE id = ?', [senderId]);
+    const receiver = await Database.get('SELECT * FROM users WHERE id = ?', [receiverId]);
+
+    if (!sender || !receiver) {
+      return res.status(404).json({
+        success: false,
+        error: 'Sender or receiver not found'
+      });
+    }
+
+    if (!sender.encryptedSecret) {
+      return res.status(400).json({
+        success: false,
+        error: 'Sender has no secret key configured'
+      });
+    }
+
+    // 3. Stellar Transaction using custodial secret
+    const secret = encryption.decrypt(sender.encryptedSecret);
+
+    const stellarResult = await stellarService.sendDonation({
+      sourceSecret: secret,
+      destinationPublic: receiver.publicKey,
+      amount: amount,
+      memo: memo
+    });
+
+    // 4. Record in SQLite
+    const dbResult = await Database.run(
+      'INSERT INTO transactions (senderId, receiverId, amount, memo, timestamp) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)',
+      [senderId, receiverId, amount, memo]
+    );
+
+    // 5. Record in JSON for stats backward compatibility
+    Transaction.create({
+      id: dbResult.id.toString(),
+      amount: parseFloat(amount),
+      donor: sender.publicKey,
+      recipient: receiver.publicKey,
+      stellarTxId: stellarResult.transactionId,
+      status: 'completed'
+    });
+
+    res.status(201).json({
+      success: true,
+      data: {
+        id: dbResult.id,
+        stellarTxId: stellarResult.transactionId,
+        ledger: stellarResult.ledger,
+        amount: amount,
+        sender: sender.publicKey,
+        receiver: receiver.publicKey,
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('Send donation error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send donation',
+      message: error.message
+    });
   }
 });
 
@@ -37,22 +142,84 @@ router.post('/verify', async (req, res, next) => {
  * POST /donations
  * Create a new donation
  */
-router.post('/', (req, res, next) => {
+router.post('/', requireApiKey, (req, res) => {
   try {
     const idempotencyKey = req.headers['idempotency-key'];
 
     if (!idempotencyKey) {
-      throw new ValidationError('Idempotency key is required', null, ERROR_CODES.IDEMPOTENCY_KEY_REQUIRED);
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'IDEMPOTENCY_KEY_REQUIRED',
+          message: 'Idempotency key is required'
+        }
+      });
     }
 
-    const { amount, donor, recipient } = req.body;
+    const { amount, donor, recipient, memo } = req.body;
 
     if (!amount || !recipient) {
       throw new ValidationError('Missing required fields: amount, recipient', null, ERROR_CODES.MISSING_REQUIRED_FIELD);
     }
 
-    if (isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
-      throw new ValidationError('Amount must be a positive number', null, ERROR_CODES.INVALID_AMOUNT);
+    // Validate memo if provided
+    if (memo !== undefined && memo !== null) {
+      const memoValidation = memoValidator.validate(memo);
+      if (!memoValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: memoValidation.code,
+            message: memoValidation.error,
+            maxLength: memoValidation.maxLength,
+            currentLength: memoValidation.currentLength
+          }
+        });
+      }
+    }
+
+    const parsedAmount = parseFloat(amount);
+
+    // Validate amount type and basic checks
+    if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({
+        error: 'Amount must be a positive number'
+      });
+    }
+
+    // Validate amount against configured limits
+    const amountValidation = donationValidator.validateAmount(parsedAmount);
+    if (!amountValidation.valid) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: amountValidation.code,
+          message: amountValidation.error,
+          limits: {
+            min: amountValidation.minAmount,
+            max: amountValidation.maxAmount,
+          },
+        },
+      });
+    }
+
+    // Validate daily limit if donor is specified
+    if (donor && donor !== 'Anonymous') {
+      const dailyTotal = Transaction.getDailyTotalByDonor(donor);
+      const dailyValidation = donationValidator.validateDailyLimit(parsedAmount, dailyTotal);
+
+      if (!dailyValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: dailyValidation.code,
+            message: dailyValidation.error,
+            dailyLimit: dailyValidation.maxDailyAmount,
+            currentDailyTotal: dailyValidation.currentDailyTotal,
+            remainingDaily: dailyValidation.remainingDaily,
+          },
+        });
+      }
     }
 
     const normalizedDonor = typeof donor === 'string' ? donor.trim() : '';
@@ -66,10 +233,14 @@ router.post('/', (req, res, next) => {
     const donationAmount = parseFloat(amount);
     const feeCalculation = calculateAnalyticsFee(donationAmount);
 
+    // Sanitize memo for storage
+    const sanitizedMemo = memo ? memoValidator.sanitize(memo) : '';
+
     const transaction = Transaction.create({
-      amount: donationAmount,
+      amount: parsedAmount,
       donor: donor || 'Anonymous',
       recipient,
+      memo: sanitizedMemo,
       idempotencyKey,
       analyticsFee: feeCalculation.fee,
       analyticsFeePercentage: feeCalculation.feePercentage
@@ -102,6 +273,30 @@ router.get('/', (req, res, next) => {
 });
 
 /**
+ * GET /donations/limits
+ * Get current donation amount limits
+ */
+router.get('/limits', (req, res) => {
+  try {
+    const limits = donationValidator.getLimits();
+    res.json({
+      success: true,
+      data: {
+        minAmount: limits.minAmount,
+        maxAmount: limits.maxAmount,
+        maxDailyPerDonor: limits.maxDailyPerDonor,
+        currency: 'XLM',
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to retrieve limits',
+      message: error.message
+    });
+  }
+});
+
+/**
  * GET /donations/recent
  * Get recent donations (read-only, no sensitive data)
  * Query params:
@@ -116,7 +311,7 @@ router.get('/recent', (req, res, next) => {
     }
 
     const transactions = Transaction.getAll();
-    
+
     // Sort by timestamp descending (most recent first)
     const sortedTransactions = transactions
       .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
@@ -150,7 +345,7 @@ router.get('/recent', (req, res, next) => {
 router.get('/:id', (req, res, next) => {
   try {
     const transaction = Transaction.getById(req.params.id);
-    
+
     if (!transaction) {
       throw new NotFoundError('Donation not found', ERROR_CODES.DONATION_NOT_FOUND);
     }
