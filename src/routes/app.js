@@ -10,6 +10,7 @@ const logger = require('../middleware/logger');
 const { attachUserRole } = require('../middleware/rbacMiddleware');
 const Database = require('../utils/database');
 const log = require('../utils/log');
+const requestId = require('../middleware/requestId');
 
 const app = express();
 
@@ -56,6 +57,15 @@ app.use(notFoundHandler);
 
 // Global error handler
 app.use(errorHandler);
+
+// Task: Generate ID per request (Must be first)
+app.use(requestId);
+
+// Update Logger to use the ID
+app.use((req, res, next) => {
+  log.info('HTTP', `${req.method} ${req.url}`, { requestId: req.id });
+  next();
+});
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
