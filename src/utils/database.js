@@ -1,8 +1,40 @@
-const sqlite3 = require('sqlite3').verbose();
+require('dotenv').config({ path: require('path').join(__dirname, '../../src/.env') });
+
+const initSqlJs = require('sql.js');
 const path = require('path');
 const { DatabaseError } = require('./errors');
 
-const DB_PATH = path.join(__dirname, '../../data/stellar_donations.db');
+async function initDB() {
+  if (initPromise) {
+    return initPromise;
+  }
+  
+  initPromise = (async () => {
+    if (!SQL) {
+      SQL = await initSqlJs();
+      
+      // Try to load existing database
+      if (fs.existsSync(DB_PATH)) {
+        const fileBuffer = fs.readFileSync(DB_PATH);
+        db = new SQL.Database(fileBuffer);
+      } else {
+        db = new SQL.Database();
+      }
+    }
+    return db;
+  })();
+  
+  return initPromise;
+}
+
+// Save database to file
+function saveDB() {
+  if (db) {
+    const data = db.export();
+    const buffer = Buffer.from(data);
+    fs.writeFileSync(DB_PATH, buffer);
+  }
+}
 
 class Database {
   static getConnection() {
