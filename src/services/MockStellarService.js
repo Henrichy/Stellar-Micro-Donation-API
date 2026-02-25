@@ -56,7 +56,173 @@ class MockStellarService {
     // Rate limiting state
     this.requestTimestamps = [];
     
-    log.info('MOCK_STELLAR_SERVICE', 'Initialized with config', this.config);
+    // Failure simulation state
+    this.failureSimulation = {
+      enabled: false,
+      type: null, // 'timeout', 'network_error', 'service_unavailable', 'bad_sequence', 'tx_failed'
+      probability: 0, // 0-1
+      consecutiveFailures: 0,
+      maxConsecutiveFailures: 0,
+    };
+  }
+
+  /**
+   * Enable failure simulation for testing
+   * @param {string} type - Type of failure to simulate
+   * @param {number} probability - Probability of failure (0-1)
+   */
+  enableFailureSimulation(type, probability = 1.0) {
+    this.failureSimulation.enabled = true;
+    this.failureSimulation.type = type;
+    this.failureSimulation.probability = probability;
+    this.failureSimulation.consecutiveFailures = 0;
+    log.info('MOCK_STELLAR_SERVICE', 'Failure simulation enabled', { type, probability });
+  }
+
+  /**
+   * Disable failure simulation
+   */
+  disableFailureSimulation() {
+    this.failureSimulation.enabled = false;
+    this.failureSimulation.type = null;
+    this.failureSimulation.probability = 0;
+    this.failureSimulation.consecutiveFailures = 0;
+  }
+
+  /**
+   * Set maximum consecutive failures before auto-recovery
+   * @param {number} max - Maximum consecutive failures
+   */
+  setMaxConsecutiveFailures(max) {
+    this.failureSimulation.maxConsecutiveFailures = max;
+  }
+
+  _isRetryableError(error) {
+    return Boolean(error && error.details && error.details.retryable);
+  }
+
+  async _executeWithRetry(operation) {
+    const maxFailures = this.failureSimulation.maxConsecutiveFailures;
+    const maxAttempts = maxFailures > 0 ? maxFailures + 1 : 1;
+    let lastError;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        lastError = error;
+        if (!this._isRetryableError(error) || attempt === maxAttempts) {
+          throw error;
+        }
+      }
+    }
+
+    throw lastError;
+  }
+
+  /**
+   * Simulate various network and Stellar failures
+   * @private
+   */
+  _simulateFailure() {
+    if (!this.failureSimulation.enabled) return;
+    
+    // Check if we should fail based on probability
+    if (Math.random() > this.failureSimulation.probability) {
+      this.failureSimulation.consecutiveFailures = 0;
+      return;
+    }
+
+    // Check if we've hit max consecutive failures (auto-recovery)
+    if (this.failureSimulation.maxConsecutiveFailures > 0 &&
+        this.failureSimulation.consecutiveFailures >= this.failureSimulation.maxConsecutiveFailures) {
+      this.failureSimulation.consecutiveFailures = 0;
+      this.failureSimulation.enabled = false;
+      return;
+    }
+
+    this.failureSimulation.consecutiveFailures++;
+
+    const failureType = this.failureSimulation.type;
+    
+    switch (failureType) {
+      case 'timeout':
+        throw new BusinessLogicError(
+          ERROR_CODES.TRANSACTION_FAILED,
+          'Request timeout - Stellar network may be experiencing high load. Please try again.',
+          { retryable: true, retryAfter: 5000 }
+        );
+      
+      case 'network_error':
+        throw new BusinessLogicError(
+          ERROR_CODES.TRANSACTION_FAILED,
+          'Network error: Unable to connect to Stellar Horizon server. Check your connection.',
+          { retryable: true, retryAfter: 3000 }
+        );
+      
+      case 'service_unavailable':
+        throw new BusinessLogicError(
+          ERROR_CODES.TRANSACTION_FAILED,
+          'Service temporarily unavailable: Stellar Horizon is under maintenance. Please try again later.',
+          { retryable: true, retryAfter: 10000 }
+        );
+      
+      case 'bad_sequence':
+        throw new BusinessLogicError(
+          ERROR_CODES.TRANSACTION_FAILED,
+          'tx_bad_seq: Transaction sequence number does not match source account. This usually indicates a concurrent transaction.',
+          { retryable: true, retryAfter: 1000 }
+        );
+      
+      case 'tx_failed':
+        throw new BusinessLogicError(
+          ERROR_CODES.TRANSACTION_FAILED,
+          'tx_failed: Transaction failed due to network congestion or insufficient fee. Please retry with higher fee.',
+          { retryable: true, retryAfter: 2000 }
+        );
+      
+      case 'tx_insufficient_fee':
+        throw new BusinessLogicError(
+          ERROR_CODES.TRANSACTION_FAILED,
+          'tx_insufficient_fee: Transaction fee is too low for current network conditions.',
+          { retryable: true, retryAfter: 1000 }
+        );
+      
+      case 'connection_refused':
+        throw new BusinessLogicError(
+          ERROR_CODES.TRANSACTION_FAILED,
+          'Connection refused: Unable to establish connection to Stellar network.',
+          { retryable: true, retryAfter: 5000 }
+        );
+      
+      case 'rate_limit_horizon':
+        throw new BusinessLogicError(
+          ERROR_CODES.TRANSACTION_FAILED,
+          'Horizon rate limit exceeded: Too many requests to Stellar network. Please slow down.',
+          { retryable: true, retryAfter: 60000 }
+        );
+      
+      case 'partial_response':
+        throw new BusinessLogicError(
+          ERROR_CODES.TRANSACTION_FAILED,
+          'Incomplete response from Stellar network. Data may be corrupted.',
+          { retryable: true, retryAfter: 2000 }
+        );
+      
+      case 'ledger_closed':
+        throw new BusinessLogicError(
+          ERROR_CODES.TRANSACTION_FAILED,
+          'Ledger already closed: Transaction missed the ledger window. Please resubmit.',
+          { retryable: true, retryAfter: 5000 }
+        );
+      
+      default:
+        throw new BusinessLogicError(
+          ERROR_CODES.TRANSACTION_FAILED,
+          'Unknown network error occurred',
+          { retryable: true, retryAfter: 3000 }
+        );
+    }
   }
 
   /**
@@ -233,23 +399,26 @@ class MockStellarService {
    * @returns {Promise<{balance: string, asset: string}>}
    */
   async getBalance(publicKey) {
-    await this._simulateNetworkDelay();
-    this._checkRateLimit();
-    this._validatePublicKey(publicKey);
-    
-    const wallet = this.wallets.get(publicKey);
-    
-    if (!wallet) {
-      throw new NotFoundError(
-        `Account not found. The account ${publicKey} does not exist on the network.`,
-        ERROR_CODES.WALLET_NOT_FOUND
-      );
-    }
+    return this._executeWithRetry(async () => {
+      await this._simulateNetworkDelay();
+      this._checkRateLimit();
+      this._validatePublicKey(publicKey);
+      this._simulateFailure(); // New failure simulation
+      
+      const wallet = this.wallets.get(publicKey);
+      
+      if (!wallet) {
+        throw new NotFoundError(
+          `Account not found. The account ${publicKey} does not exist on the network.`,
+          ERROR_CODES.WALLET_NOT_FOUND
+        );
+      }
 
-    return {
-      balance: wallet.balance,
-      asset: 'XLM',
-    };
+      return {
+        balance: wallet.balance,
+        asset: 'XLM',
+      };
+    });
   }
 
   /**
@@ -258,36 +427,39 @@ class MockStellarService {
    * @returns {Promise<{balance: string}>}
    */
   async fundTestnetWallet(publicKey) {
-    await this._simulateNetworkDelay();
-    this._checkRateLimit();
-    this._validatePublicKey(publicKey);
-    this._simulateRandomFailure();
-    
-    const wallet = this.wallets.get(publicKey);
-    
-    if (!wallet) {
-      throw new NotFoundError(
-        `Account not found. The account ${publicKey} does not exist on the network.`,
-        ERROR_CODES.WALLET_NOT_FOUND
-      );
-    }
+    return this._executeWithRetry(async () => {
+      await this._simulateNetworkDelay();
+      this._checkRateLimit();
+      this._validatePublicKey(publicKey);
+      this._simulateFailure(); // New failure simulation
+      this._simulateRandomFailure();
+      
+      const wallet = this.wallets.get(publicKey);
+      
+      if (!wallet) {
+        throw new NotFoundError(
+          `Account not found. The account ${publicKey} does not exist on the network.`,
+          ERROR_CODES.WALLET_NOT_FOUND
+        );
+      }
 
-    // Check if already funded
-    if (parseFloat(wallet.balance) > 0) {
-      throw new BusinessLogicError(
-        ERROR_CODES.TRANSACTION_FAILED,
-        'Account is already funded. Friendbot can only fund accounts once.'
-      );
-    }
+      // Check if already funded
+      if (parseFloat(wallet.balance) > 0) {
+        throw new BusinessLogicError(
+          ERROR_CODES.TRANSACTION_FAILED,
+          'Account is already funded. Friendbot can only fund accounts once.'
+        );
+      }
 
-    // Simulate Friendbot funding with 10000 XLM
-    wallet.balance = '10000.0000000';
-    wallet.fundedAt = new Date().toISOString();
-    wallet.sequence = '1'; // Increment sequence after funding
+      // Simulate Friendbot funding with 10000 XLM
+      wallet.balance = '10000.0000000';
+      wallet.fundedAt = new Date().toISOString();
+      wallet.sequence = '1'; // Increment sequence after funding
 
-    return {
-      balance: wallet.balance,
-    };
+      return {
+        balance: wallet.balance,
+      };
+    });
   }
 
   /**
@@ -330,12 +502,14 @@ class MockStellarService {
    * @returns {Promise<{transactionId: string, ledger: number, status: string, confirmedAt: string}>}
    */
   async sendDonation({ sourceSecret, destinationPublic, amount, memo }) {
-    await this._simulateNetworkDelay();
-    this._checkRateLimit();
-    this._validateSecretKey(sourceSecret);
-    this._validatePublicKey(destinationPublic);
-    this._validateAmount(amount);
-    this._simulateRandomFailure();
+    return this._executeWithRetry(async () => {
+      await this._simulateNetworkDelay();
+      this._checkRateLimit();
+      this._validateSecretKey(sourceSecret);
+      this._validatePublicKey(destinationPublic);
+      this._validateAmount(amount);
+      this._simulateFailure(); // New failure simulation
+      this._simulateRandomFailure();
     
     // Find source wallet by secret key
     let sourceWallet = null;
@@ -423,12 +597,13 @@ class MockStellarService {
     this._notifyStreamListeners(sourceWallet.publicKey, transaction);
     this._notifyStreamListeners(destinationPublic, transaction);
 
-    return {
-      transactionId: transaction.transactionId,
-      ledger: transaction.ledger,
-      status: transaction.status,
-      confirmedAt: transaction.confirmedAt,
-    };
+      return {
+        transactionId: transaction.transactionId,
+        ledger: transaction.ledger,
+        status: transaction.status,
+        confirmedAt: transaction.confirmedAt,
+      };
+    });
   }
 
   /**
@@ -562,12 +737,14 @@ class MockStellarService {
    * @returns {Promise<{hash: string, ledger: number}>}
    */
   async sendPayment(sourcePublicKey, destinationPublic, amount, memo = '') {
-    await this._simulateNetworkDelay();
-    this._checkRateLimit();
-    this._validatePublicKey(sourcePublicKey);
-    this._validatePublicKey(destinationPublic);
-    this._validateAmount(amount.toString());
-    this._simulateRandomFailure();
+    return this._executeWithRetry(async () => {
+      await this._simulateNetworkDelay();
+      this._checkRateLimit();
+      this._validatePublicKey(sourcePublicKey);
+      this._validatePublicKey(destinationPublic);
+      this._validateAmount(amount.toString());
+      this._simulateFailure(); // New failure simulation
+      this._simulateRandomFailure();
     
     let sourceWallet = this.wallets.get(sourcePublicKey);
     
@@ -644,10 +821,11 @@ class MockStellarService {
       destination: `${destinationPublic.substring(0, 8)}...`,
     });
 
-    return {
-      hash: transaction.hash,
-      ledger: transaction.ledger,
-    };
+      return {
+        hash: transaction.hash,
+        ledger: transaction.ledger,
+      };
+    });
   }
 
   /**

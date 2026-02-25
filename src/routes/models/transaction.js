@@ -9,6 +9,7 @@ const {
 } = require('../../utils/transactionStateMachine');
 
 class Transaction {
+  static eventEmitter = donationEvents;
   static getDbPath() {
     return config.dbPath;
   }
@@ -37,6 +38,14 @@ class Transaction {
   static saveTransactions(transactions) {
     this.ensureDbDir();
     fs.writeFileSync(this.getDbPath(), JSON.stringify(transactions, null, 2));
+  }
+
+  /**
+   * Set the event emitter instance (for testing)
+   * @param {Object} emitter - Event emitter to use
+   */
+  static setEventEmitter(emitter) {
+    this.eventEmitter = emitter;
   }
 
   static create(transactionData) {
@@ -177,6 +186,11 @@ class Transaction {
           t.status !== 'cancelled';
       })
       .reduce((total, t) => total + t.amount, 0);
+  }
+
+  // Test helper for integration suites.
+  static _clearAllData() {
+    this.saveTransactions([]);
   }
 }
 

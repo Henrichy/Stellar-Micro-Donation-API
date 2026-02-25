@@ -1,31 +1,23 @@
 const fs = require('fs');
 const path = require('path');
 const log = require('../utils/log');
-const { maskSensitiveData } = require('../utils/dataMasker');
+const config = require('../config');
 
 /**
- * Logger Middleware for Request/Response Logging
- * Logs incoming requests and outgoing responses with sensitive data filtering
+ * Request/Response Auditing Middleware
+ * Intent: Provide full observability into the API lifecycle while strictly 
+ * adhering to data privacy by redacting PII and sensitive blockchain keys.
  */
 class Logger {
   constructor(options = {}) {
     this.logToFile = options.logToFile || false;
     this.logDir = options.logDir || path.join(__dirname, '../../logs');
+    
+    // List of fields to be redacted during the sanitization process
     this.sensitiveFields = options.sensitiveFields || [
-      'password',
-      'secretKey',
-      'secret',
-      'token',
-      'authorization',
-      'apiKey',
-      'api_key',
-      'api-key',
-      'privateKey',
-      'private_key',
-      'creditCard',
-      'credit_card',
-      'ssn',
-      'social_security'
+      'password', 'secretKey', 'secret', 'token', 'authorization',
+      'apiKey', 'api_key', 'api-key', 'privateKey', 'private_key',
+      'creditCard', 'credit_card', 'ssn', 'social_security'
     ];
 
     if (this.logToFile) {
@@ -34,7 +26,8 @@ class Logger {
   }
 
   /**
-   * Ensure log directory exists
+   * Intent: Ensure the physical log storage path exists on the filesystem.
+   * Flow: Checks existence -> Creates directory recursively if missing.
    */
   ensureLogDirectory() {
     if (!fs.existsSync(this.logDir)) {
@@ -43,29 +36,52 @@ class Logger {
   }
 
   /**
-   * Sanitize object by removing sensitive fields
-   * Uses the centralized dataMasker utility for consistent masking
-   * @param {Object} obj - Object to sanitize
-   * @returns {Object} Sanitized object
+   * Intent: Prevent sensitive data (like Stellar Private Keys) from leaking into logs.
+   * Flow: 
+   * 1. Recursively traverses objects and arrays.
+   * 2. Matches keys against the 'sensitiveFields' blacklist (case-insensitive).
+   * 3. Replaces matched values with '[REDACTED]'.
    */
   sanitize(obj) {
-    return maskSensitiveData(obj, {
-      showPartial: process.env.LOG_SHOW_PARTIAL === 'true'
-    });
+    if (!obj || typeof obj !== 'object') {
+      return obj;
+    }
+
+    if (Array.isArray(obj)) {
+      return obj.map(item => this.sanitize(item));
+    }
+
+    const sanitized = {};
+    for (const [key, value] of Object.entries(obj)) {
+      const lowerKey = key.toLowerCase();
+      
+      const isSensitive = this.sensitiveFields.some(field => 
+        lowerKey.includes(field.toLowerCase())
+      );
+
+      if (isSensitive) {
+        sanitized[key] = '[REDACTED]';
+      } else if (typeof value === 'object' && value !== null) {
+        sanitized[key] = this.sanitize(value);
+      } else {
+        sanitized[key] = value;
+      }
+    }
+
+    return sanitized;
   }
 
   /**
-   * Format log entry
-   * @param {Object} logData - Log data to format
-   * @returns {string} Formatted log string
+   * Intent: Prepare log data for persistent storage.
+   * Flow: Converts log object to a pretty-printed JSON string.
    */
   formatLog(logData) {
     return JSON.stringify(logData, null, 2);
   }
 
   /**
-   * Write log to file
-   * @param {Object} logData - Log data to write
+   * Intent: Persist log entries to the disk for long-term auditing.
+   * Flow: Calculates date-based filename -> Appends JSON entry to file -> Handles write errors.
    */
   writeToFile(logData) {
     if (!this.logToFile) return;
@@ -82,13 +98,16 @@ class Logger {
   }
 
   /**
-   * Log to console
-   * @param {Object} logData - Log data to output
+   * Intent: Provide real-time feedback to developers via the console using structured logging.
+   * Flow: 
+   * 1. Applies ANSI color codes based on HTTP status (Green/Yellow/Red).
+   * 2. Outputs high-level summary including Method, Endpoint, Status, and requestId.
+   * 3. If LOG_VERBOSE is active, outputs full sanitized request/response bodies.
+   * 4. If Debug Mode is active, logs granular metadata (headers, query, IP).
    */
   logToConsole(logData) {
-    const { timestamp, method, endpoint, statusCode, duration } = logData;
+    const { method, endpoint, statusCode, duration, requestId } = logData;
     
-    // Color coding based on status code
     let statusColor = '\x1b[32m'; // Green for 2xx
     if (statusCode >= 400 && statusCode < 500) {
       statusColor = '\x1b[33m'; // Yellow for 4xx
@@ -97,26 +116,60 @@ class Logger {
     }
     const resetColor = '\x1b[0m';
 
+    // Log high-level summary
     log.info('REQUEST_LOGGER', `${method} ${endpoint} ${statusColor}${statusCode}${resetColor} - ${duration}ms`, {
-      timestamp,
+      requestId,
+      statusCode,
+      duration,
+      method,
+      endpoint,
+      timestamp
     });
 
-    // Log request/response details in verbose mode
-    if (process.env.LOG_VERBOSE === 'true') {
-      log.info('REQUEST_LOGGER', 'Request payload', logData.request);
-      log.info('REQUEST_LOGGER', 'Response payload', logData.response);
+    if (config.logging.verbose) {
+      log.info('REQUEST_LOGGER', 'Request payload', { 
+        requestId,
+        ...logData.request 
+      });
+      log.info('REQUEST_LOGGER', 'Response payload', { 
+        requestId,
+        ...logData.response 
+      });
+    }
+
+    if (log.isDebugMode) {
+      log.debug('REQUEST_LOGGER', 'Request details', {
+        requestId,
+        headers: this.sanitize(logData.request?.headers),
+        query: logData.request?.query,
+        params: logData.request?.params,
+        ip: logData.request?.ip
+      });
+      log.debug('REQUEST_LOGGER', 'Response details', {
+        requestId,
+        statusCode,
+        duration: `${duration}ms`
+      });
     }
   }
 
   /**
-   * Express middleware for request/response logging
+   * Main Middleware Function
+   * Intent: Intercept the Express request/response cycle to capture performance and payload data.
+   * * Flow:
+   * 1. Start: Record timestamp and start time.
+   * 2. Interception: Overrides 'res.json' to capture the response body before it's sent to the client.
+   * 3. Next: Passes control to subsequent middleware/controllers.
+   * 4. Completion: Listens for the 'finish' event on the response object.
+   * 5. Capture: Aggregates headers, query params, sanitized bodies, and calculates duration.
+   * 6. Output: Dispatches the aggregated data to the console and file system.
    */
   middleware() {
     return (req, res, next) => {
       const startTime = Date.now();
       const timestamp = new Date().toISOString();
+      const requestId = req.id; 
 
-      // Capture original res.json to intercept response
       const originalJson = res.json.bind(res);
       let responseBody = null;
 
@@ -125,12 +178,12 @@ class Logger {
         return originalJson(body);
       };
 
-      // Log after response is sent
       res.on('finish', () => {
         const duration = Date.now() - startTime;
 
         const logData = {
           timestamp,
+          requestId, 
           method: req.method,
           endpoint: req.originalUrl || req.url,
           statusCode: res.statusCode,
@@ -148,10 +201,7 @@ class Logger {
           }
         };
 
-        // Log to console
         this.logToConsole(logData);
-
-        // Log to file if enabled
         this.writeToFile(logData);
       });
 
@@ -160,11 +210,12 @@ class Logger {
   }
 }
 
-// Export singleton instance
+const config = require('../config');
+
 const logger = new Logger({
-  logToFile: process.env.LOG_TO_FILE === 'true',
-  logDir: process.env.LOG_DIR || path.join(__dirname, '../../logs')
+  logToFile: config.logging.toFile,
+  logDir: config.logging.directory
 });
 
 module.exports = logger;
-module.exports.Logger = Logger; // Export class for testing
+module.exports.Logger = Logger;

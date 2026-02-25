@@ -5,12 +5,18 @@
  */
 
 const MockStellarService = require('../src/services/MockStellarService');
+const { resetMockStellarService } = require('./helpers/testIsolation');
 
-describe('MockStellarService', () => {
+describe('MockStellarService - Unit Tests', () => {
   let service;
 
   beforeEach(() => {
     service = new MockStellarService();
+  });
+
+  afterEach(() => {
+    // Clean up service state after each test
+    resetMockStellarService(service);
   });
 
   describe('Wallet Creation', () => {
@@ -40,8 +46,8 @@ describe('MockStellarService', () => {
     });
   });
 
-  describe('Wallet Balance', () => {
-    test('should retrieve wallet balance', async () => {
+  describe('Wallet Balance Retrieval', () => {
+    test('should retrieve wallet balance successfully', async () => {
       const wallet = await service.createWallet();
       const balance = await service.getBalance(wallet.publicKey);
 
@@ -78,8 +84,8 @@ describe('MockStellarService', () => {
     });
   });
 
-  describe('Donations', () => {
-    test('should send donation between wallets', async () => {
+  describe('Donation Transactions', () => {
+    test('should send donation between wallets successfully', async () => {
       const source = await service.createWallet();
       const destination = await service.createWallet();
 
@@ -217,7 +223,7 @@ describe('MockStellarService', () => {
   });
 
   describe('Transaction Streaming', () => {
-    test('should stream transactions to listener', async () => {
+    test('should stream transactions to listener in real-time', async () => {
       const source = await service.createWallet();
       const destination = await service.createWallet();
 
