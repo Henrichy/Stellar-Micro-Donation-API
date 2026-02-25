@@ -410,9 +410,10 @@ For detailed information, see [Stellar Failure Simulation Guide](docs/STELLAR_FA
 - **[API Examples](docs/API_EXAMPLES.md)** - Complete request/response examples for all endpoints
 - **[Stellar Failure Simulation](docs/STELLAR_FAILURE_SIMULATION.md)** - Network failure testing guide
 - [Architecture Documentation](docs/ARCHITECTURE.md) - Detailed system architecture
-- [API Flow Diagram](docs/API_FLOW.md) - API request flow
-- [Quick Start Guide](docs/guides/QUICK_START.md) - Getting started quickly
-- [Mock Stellar Guide](docs/guides/MOCK_STELLAR_GUIDE.md) - Using mock Stellar service
+- [API Flow Diagram](API%20flow%20diagram.txt) - API request flow
+- [Pre-Deployment Checklist](docs/guides/PRE_DEPLOYMENT_CHECKLIST.md) - Production deployment verification
+- [Mock Stellar Guide](MOCK_STELLAR_GUIDE.md) - Using mock Stellar service
+- [Quick Start Guide](QUICK_START.md) - Getting started quickly
 
 ## 🔧 Configuration
 
@@ -466,3 +467,17 @@ For issues and questions:
 ---
 
 Built with ❤️ using Node.js and Stellar
+
+
+## 📚 Documentation
+
+For comprehensive documentation, see the [Documentation Index](docs/README.md).
+
+### Key Documentation
+
+- **[Pre-Deployment Checklist](docs/guides/PRE_DEPLOYMENT_CHECKLIST.md)** - Production deployment verification
+- **[Quick Start Guide](docs/guides/QUICK_START.md)** - Get started quickly
+- **[API Examples](docs/API_EXAMPLES.md)** - Complete API usage examples
+- **[Coverage Guide](docs/COVERAGE_GUIDE.md)** - Test coverage documentation
+- **[Mock Stellar Guide](docs/guides/MOCK_STELLAR_GUIDE.md)** - Testing without network calls
+
