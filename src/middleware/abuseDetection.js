@@ -1,5 +1,4 @@
 const abuseDetector = require('../utils/abuseDetector');
-const log = require('../utils/log');
 
 /**
  * Middleware to track requests for abuse detection
