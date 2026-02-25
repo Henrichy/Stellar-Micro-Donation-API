@@ -14,6 +14,7 @@ const { errorHandler, notFoundHandler } = require('../middleware/errorHandler');
 const logger = require('../middleware/logger');
 const { attachUserRole } = require('../middleware/rbac');
 const abuseDetectionMiddleware = require('../middleware/abuseDetection');
+const { payloadSizeLimiter } = require('../middleware/payloadSizeLimit');
 const Database = require('../utils/database');
 const { initializeApiKeysTable } = require('../models/apiKeys');
 const { validateRBAC } = require('../utils/rbacValidator');
@@ -31,8 +32,13 @@ const stellarService = getStellarService();
 const reconciliationService = new TransactionReconciliationService(stellarService);
 
 // Middleware
-app.use(express.json());
 app.use(requestId);
+
+// Payload size limit (must be before body parsers)
+app.use(payloadSizeLimiter);
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Request/Response logging middleware
 app.use(logger.middleware());
