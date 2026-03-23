@@ -70,13 +70,23 @@ app.use(require('../middleware/suspiciousPatternDetection'));
 // Attach user role from authentication (must be before routes)
 app.use(attachUserRole());
 
-// Routes
-app.use('/wallets', walletRoutes);
-app.use('/donations', donationRoutes);
-app.use('/stats', statsRoutes);
-app.use('/stream', streamRoutes);
-app.use('/transactions', transactionRoutes);
-app.use('/api-keys', apiKeysRoutes);
+// API Versioning and Routing
+const apiVersionMiddleware = require('../middleware/apiVersion');
+
+const apiV1Router = express.Router();
+apiV1Router.use('/wallets', walletRoutes);
+apiV1Router.use('/donations', donationRoutes);
+apiV1Router.use('/stats', statsRoutes);
+apiV1Router.use('/stream', streamRoutes);
+apiV1Router.use('/transactions', transactionRoutes);
+apiV1Router.use('/api-keys', apiKeysRoutes);
+
+const routeVersions = {
+  '1': apiV1Router
+};
+
+// Dispatch routes with version middleware
+app.use(apiVersionMiddleware(routeVersions));
 
 // Health check endpoints
 app.get('/health', async (req, res) => {
