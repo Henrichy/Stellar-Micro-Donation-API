@@ -652,6 +652,59 @@ router.patch('/:id/status', checkPermission(PERMISSIONS.DONATIONS_UPDATE), updat
   }
 });
 
+/**
+ * POST /donations/:id/refund
+ * Initiate a refund for a confirmed donation
+ * Requires admin or refund permission
+ */
+router.post('/:id/refund', requireApiKey, checkPermission(PERMISSIONS.DONATIONS_UPDATE), donationIdParamSchema, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    log.debug('DONATION_ROUTE', 'Processing refund request', {
+      requestId: req.id,
+      donationId: id,
+      reason
+    });
+
+    // Validate donation ID
+    if (!id || isNaN(parseInt(id, 10))) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_REQUEST',
+          message: 'Invalid donation ID'
+        }
+      });
+    }
+
+    // Process refund
+    const refundResult = await donationService.refundDonation(id, {
+      reason: reason || null,
+      requestId: req.id
+    });
+
+    // Mark processing complete
+    if (req.markLifecycleStage) {
+      req.markLifecycleStage(LIFECYCLE_STAGES.PROCESSED);
+    }
+
+    res.status(201).json({
+      success: true,
+      data: refundResult
+    });
+  } catch (error) {
+    log.error('DONATION_ROUTE', 'Failed to process refund', {
+      requestId: req.id,
+      error: error.message,
+      stack: error.stack
+    });
+
+    next(error);
+  }
+});
+
 // ─── Claimable Balance Endpoints ─────────────────────────────────────────────
 
 const createClaimableSchema = validateSchema({

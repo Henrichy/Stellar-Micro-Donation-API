@@ -260,6 +260,7 @@ const buildConfig = (env, isProduction, isTest) => {
     minAmount: parseFloat(process.env.MIN_DONATION_AMOUNT, 0.01, 0, null, 'MIN_DONATION_AMOUNT'),
     maxAmount: parseFloat(process.env.MAX_DONATION_AMOUNT, 10000, 0, null, 'MAX_DONATION_AMOUNT'),
     maxDailyPerDonor: parseFloat(process.env.MAX_DAILY_DONATION_PER_DONOR, 0, 0, null, 'MAX_DAILY_DONATION_PER_DONOR'),
+    refundEligibilityWindowDays: parseInteger(process.env.REFUND_ELIGIBILITY_WINDOW_DAYS, 30, 1, null, 'REFUND_ELIGIBILITY_WINDOW_DAYS'),
   };
 
   // Logging configuration
