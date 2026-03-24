@@ -23,7 +23,6 @@ const log = require('../utils/log');
 const priceOracle = require('./PriceOracleService');
 const { buildOverpaymentRecord } = require('../utils/overpaymentDetector');
 const memoCollisionDetector = require('../utils/memoCollisionDetector');
-const priceOracle = require('./PriceOracleService');
 
 class DonationService {
   constructor(stellarService) {
@@ -86,7 +85,7 @@ class DonationService {
    * @param {string} params.requestId - Request ID for logging
    * @returns {Promise<Object>} Donation result with transaction details
    */
-  async sendCustodialDonation({ senderId, receiverId, amount, memo, idempotencyKey, requestId }) {
+  async sendCustodialDonation({ senderId, receiverId, amount, memo, idempotencyKey, requestId, campaign_id }) {
     log.debug('DONATION_SERVICE', 'Processing custodial donation', {
       requestId,
       senderId,
@@ -137,9 +136,15 @@ class DonationService {
 
     // Record in database with sanitized memo
     const dbResult = await Database.run(
-      'INSERT INTO transactions (senderId, receiverId, amount, memo, timestamp, idempotencyKey, stellar_tx_id) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)',
-      [senderId, receiverId, amount, sanitizedMemo, idempotencyKey, stellarResult.transactionId]
+      'INSERT INTO transactions (senderId, receiverId, amount, memo, timestamp, idempotencyKey, stellar_tx_id, campaign_id) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)',
+      [senderId, receiverId, amount, sanitizedMemo, idempotencyKey, stellarResult.transactionId, campaign_id || null]
     );
+
+    if (campaign_id) {
+      await this.processCampaignContribution(campaign_id, amount).catch(err => {
+        log.error('DONATION_SERVICE', 'Failed to update campaign contribution', { error: err.message });
+      });
+    }
 
     // Record in JSON with state transitions
     const transaction = Transaction.create({
@@ -359,12 +364,10 @@ class DonationService {
    * @param {string} params.donor - Donor identifier
    * @param {string} params.recipient - Recipient identifier
    * @param {string} params.memo - Optional memo
-   * @param {string} [params.memoType='text'] - Stellar memo type: 'text', 'hash', 'id', or 'return'
    * @param {string} params.idempotencyKey - Idempotency key
    * @returns {Object} Created transaction
    */
-  async createDonationRecord({ amount, donor, recipient, memo, memoType = 'text', idempotencyKey, receivedAmount, sessionId }) {
-  async createDonationRecord({ amount, currency = 'XLM', donor, recipient, memo, idempotencyKey, receivedAmount, sessionId }) {
+  async createDonationRecord({ amount, currency = 'XLM', donor, recipient, memo, idempotencyKey, receivedAmount, sessionId, campaign_id }) {
     // Sanitize identifiers
     const sanitizedDonor = donor ? sanitizeIdentifier(donor) : 'Anonymous';
     const sanitizedRecipient = sanitizeIdentifier(recipient);
@@ -440,7 +443,14 @@ class DonationService {
       // Overpayment fields (null when no overpayment)
       overpaymentFlagged: overpayment ? true : false,
       overpaymentDetails: overpayment || null,
+      campaign_id: campaign_id || null
     });
+
+    if (campaign_id) {
+      await this.processCampaignContribution(campaign_id, xlmAmount).catch(err => {
+        log.error('DONATION_SERVICE', 'Failed to update campaign contribution', { error: err.message });
+      });
+    }
 
     // Detect memo collision after the record is created so we have a transactionId
     const collisionResult = memoCollisionDetector.check({
@@ -471,6 +481,37 @@ class DonationService {
     }
 
     return transaction;
+  }
+
+  /**
+   * Update campaign progress and trigger Webhooks if goal met
+   */
+  async processCampaignContribution(campaignId, amount) {
+    const WebhookService = require('./WebhookService');
+    const updateResult = await Database.run(
+      `UPDATE campaigns 
+       SET current_amount = current_amount + ? 
+       WHERE id = ? AND status = 'active'`,
+      [amount, campaignId]
+    );
+
+    if (updateResult && updateResult.changes > 0) {
+      const campaign = await Database.get('SELECT * FROM campaigns WHERE id = ?', [campaignId]);
+      
+      if (campaign && campaign.current_amount >= campaign.goal_amount) {
+        await Database.run(`UPDATE campaigns SET status = 'completed' WHERE id = ?`, [campaignId]);
+        
+        await WebhookService.deliver('campaign.completed', {
+          campaign_id: campaignId,
+          name: campaign.name,
+          goal_amount: campaign.goal_amount,
+          final_amount: campaign.current_amount,
+          completed_at: new Date().toISOString()
+        });
+        
+        log.info('CAMPAIGN', `Campaign ${campaignId} reached its goal and is now completed`);
+      }
+    }
   }
 
   /**

@@ -51,6 +51,7 @@ const sendDonationSchema = validateSchema({
       receiverId: { type: 'integer', required: true, min: 1 },
       amount: { type: 'number', required: true, min: 0.0000001 },
       memo: { type: 'string', required: false, maxLength: 255, nullable: true },
+      campaign_id: { type: 'integer', required: false, min: 1, nullable: true },
     },
   },
 });
@@ -88,6 +89,7 @@ const createDonationSchema = validateSchema({
         nullable: true,
         enum: ['text', 'hash', 'id', 'return'],
       },
+      campaign_id: { type: 'integerString', required: false, nullable: true },
     },
   },
 });
@@ -186,9 +188,9 @@ router.post('/verify', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), verif
  * Requires idempotency key to prevent duplicate transactions
  * Rate limited: 10 requests per minute per IP
  */
-router.post('/send', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRateLimiter, requireIdempotency, sendDonationSchema, async (req, res) => {
+router.post('/send', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRateLimiter, requireIdempotency, sendDonationSchema, async (req, res, next) => {
   try {
-    const { senderId, receiverId, amount, memo } = req.body;
+    const { senderId, receiverId, amount, memo, campaign_id } = req.body;
 
     log.debug('DONATION_ROUTE', 'Processing donation request', {
       requestId: req.id,
@@ -232,6 +234,7 @@ router.post('/send', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donatio
       receiverId,
       amount: amountValidation.value,
       memo,
+      campaign_id,
       idempotencyKey: req.idempotency.key,
       requestId: req.id
     });
@@ -342,8 +345,7 @@ router.post('/batch', payloadSizeLimiter(ENDPOINT_LIMITS.batchDonation), batchRa
  */
 router.post('/', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRateLimiter, requireApiKey, requireIdempotency, createDonationSchema, async (req, res, next) => {
   try {
-    const { amount, donor, recipient, memo, memoType } = req.body;
-    const { amount, currency, donor, recipient, memo } = req.body;
+    const { amount, currency, donor, recipient, memo, memoType, campaign_id } = req.body;
 
     // Basic validation
     if (!amount || !recipient) {
@@ -389,6 +391,7 @@ router.post('/', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRat
       recipient: resolvedRecipient,
       memo,
       memoType: memoType || 'text',
+      campaign_id: campaign_id ? parseInt(campaign_id, 10) : undefined,
       idempotencyKey: req.idempotency.key
     });
 
