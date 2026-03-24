@@ -359,9 +359,11 @@ class DonationService {
    * @param {string} params.donor - Donor identifier
    * @param {string} params.recipient - Recipient identifier
    * @param {string} params.memo - Optional memo
+   * @param {string} [params.memoType='text'] - Stellar memo type: 'text', 'hash', 'id', or 'return'
    * @param {string} params.idempotencyKey - Idempotency key
    * @returns {Object} Created transaction
    */
+  async createDonationRecord({ amount, donor, recipient, memo, memoType = 'text', idempotencyKey, receivedAmount, sessionId }) {
   async createDonationRecord({ amount, currency = 'XLM', donor, recipient, memo, idempotencyKey, receivedAmount, sessionId }) {
     // Sanitize identifiers
     const sanitizedDonor = donor ? sanitizeIdentifier(donor) : 'Anonymous';
@@ -391,8 +393,14 @@ class DonationService {
     // Validate XLM amount and limits
     this.validateDonationAmount(xlmAmount, sanitizedDonor);
 
-    // Validate and sanitize memo
-    const memoResult = this.validateAndSanitizeMemo(memo);
+    // Validate memo with type-aware validation
+    const memoResult = memoType && memoType !== 'text'
+      ? memoValidator.validateWithType(memo, memoType)
+      : this.validateAndSanitizeMemo(memo);
+
+    if (!memoResult.valid) {
+      throw new ValidationError(memoResult.error, null, memoResult.code);
+    }
 
     // Calculate analytics fee
     const feeCalculation = calculateAnalyticsFee(xlmAmount);
@@ -425,6 +433,7 @@ class DonationService {
       donor: sanitizedDonor,
       recipient: sanitizedRecipient,
       memo: memoResult.sanitized,
+      memoType: memoType || 'text',
       idempotencyKey: idempotencyKey,
       analyticsFee: feeCalculation.fee,
       analyticsFeePercentage: feeCalculation.feePercentage,

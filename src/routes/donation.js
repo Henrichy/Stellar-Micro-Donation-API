@@ -81,6 +81,12 @@ const createDonationSchema = validateSchema({
         maxLength: 255,
         nullable: true,
       },
+      memoType: {
+        type: 'string',
+        required: false,
+        nullable: true,
+        enum: ['text', 'hash', 'id', 'return'],
+      },
     },
   },
 });
@@ -335,6 +341,7 @@ router.post('/batch', batchRateLimiter, requireApiKey, async (req, res, next) =>
  */
 router.post('/', donationRateLimiter, requireApiKey, requireIdempotency, createDonationSchema, async (req, res, next) => {
   try {
+    const { amount, donor, recipient, memo, memoType } = req.body;
     const { amount, currency, donor, recipient, memo } = req.body;
 
     // Basic validation
@@ -355,6 +362,18 @@ router.post('/', donationRateLimiter, requireApiKey, requireIdempotency, createD
       });
     }
 
+    // Validate memo type + value combination
+    if (memo || memoType) {
+      const memoValidator = require('../utils/memoValidator');
+      const memoValidation = memoValidator.validateWithType(memo || '', memoType || 'text');
+      if (!memoValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: { code: memoValidation.code, message: memoValidation.error }
+        });
+      }
+    }
+
     // Resolve federation address if needed (e.g. alice*example.com → GABC...)
     let resolvedRecipient = recipient;
     if (federation.isFederationAddress(recipient)) {
@@ -368,6 +387,7 @@ router.post('/', donationRateLimiter, requireApiKey, requireIdempotency, createD
       donor,
       recipient: resolvedRecipient,
       memo,
+      memoType: memoType || 'text',
       idempotencyKey: req.idempotency.key
     });
 
