@@ -39,6 +39,7 @@ function applyNotePrivacy(req, tx) {
   const isAdmin = req.apiKey && req.apiKey.role === 'admin';
   
   if (!isOwner && !isAdmin && tx.notes !== undefined) {
+    // eslint-disable-next-line no-unused-vars
     const { notes, ...rest } = tx;
     return rest;
   }
@@ -610,7 +611,7 @@ router.get('/', checkPermission(PERMISSIONS.DONATIONS_READ), listDonationsQueryS
  * GET /donations/limits
  * Get current donation amount limits
  */
-router.get('/limits', checkPermission(PERMISSIONS.DONATIONS_READ), (req, res) => {
+router.get('/limits', checkPermission(PERMISSIONS.DONATIONS_READ), (req, res, next) => {
   try {
     const limits = donationService.getDonationLimits();
     

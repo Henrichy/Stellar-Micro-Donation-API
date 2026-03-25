@@ -24,13 +24,11 @@ const { paginateCollection } = require('../utils/pagination');
 const { checkConfirmations } = require('../utils/confirmationChecker');
 const { CONFIRMATION_LEDGER_THRESHOLD } = require('../config/confirmationThreshold');
 
-const MAX_MEMO_LENGTH = 28;
 const LimitService = require('./LimitService');
 const log = require('../utils/log');
 const priceOracle = require('./PriceOracleService');
 const { buildOverpaymentRecord } = require('../utils/overpaymentDetector');
 const memoCollisionDetector = require('../utils/memoCollisionDetector');
-const { paginateCollection } = require('../utils/pagination');
 
 class DonationService {
   constructor(stellarService) {
@@ -93,7 +91,7 @@ class DonationService {
    * @param {string} params.requestId - Request ID for logging
    * @returns {Promise<Object>} Donation result with transaction details
    */
-  async sendCustodialDonation({ senderId, receiverId, amount, memo, notes, tags, apiKeyId, apiKeyRole = 'user', idempotencyKey, requestId }) {
+  async sendCustodialDonation({ senderId, receiverId, amount, memo, notes, tags, apiKeyId, idempotencyKey, requestId, campaign_id }) {
     log.debug('DONATION_SERVICE', 'Processing custodial donation', {
       requestId,
       senderId,
@@ -380,7 +378,7 @@ class DonationService {
    * @param {string} params.idempotencyKey - Idempotency key
    * @returns {Object} Created transaction
    */
-  async createDonationRecord({ amount, currency = 'XLM', donor, recipient, memo, notes, tags, memoType = 'text', apiKeyId, apiKeyRole = 'user', idempotencyKey, receivedAmount, sessionId, anonymous = false }) {
+  async createDonationRecord({ amount, currency = 'XLM', donor, recipient, memo, notes, tags, memoType = 'text', apiKeyId, apiKeyRole = 'user', idempotencyKey, receivedAmount, sessionId, anonymous = false, campaign_id }) {
     // Sanitize identifiers
     const rawDonor = donor ? sanitizeIdentifier(donor) : 'Anonymous';
 
@@ -763,19 +761,12 @@ class DonationService {
     if (filters.tag) {
       transactions = transactions.filter(tx => tx.tags && tx.tags.includes(filters.tag));
     }
-    return paginateCollection(transactions, {
+
+    const result = paginateCollection(transactions, {
       ...pagination,
       timestampField: 'timestamp',
       idField: 'id',
-      // If custom sort was applied, disable paginateCollection's re-sort
-      // by passing a pre-sorted flag via a stable secondary sort on id only.
-      ...(useCustomSort && { _presorted: true }),
     });
-
-    // paginateCollection always re-sorts by timestamp; re-apply custom sort to the page
-    if (useCustomSort) {
-      result.data = this.applyFilters(result.data, { sortBy, order: order || 'desc' });
-    }
 
     const appliedFilters = {};
     for (const [key, val] of Object.entries(filters)) {
