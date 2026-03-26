@@ -78,6 +78,211 @@ class MockStellarService extends StellarServiceInterface {
   getNetwork() { return this.network; }
   getHorizonUrl() { return this.horizonUrl; }
 
+  /**
+   * Load account state from mock wallet storage.
+   * @param {string} address
+   * @returns {Promise<Object>}
+   */
+  async loadAccount(address) {
+    if (!this.isValidAddress(address)) {
+      throw new ValidationError('Invalid Stellar address');
+    }
+
+    const account = this.wallets.get(address);
+    if (!account) {
+      throw new NotFoundError('Account not found in mock wallets', ERROR_CODES.WALLET_NOT_FOUND);
+    }
+
+    return {
+      accountId: () => address,
+      sequenceNumber: () => account.sequence || '1',
+      balances: account.balances || [{ asset_type: 'native', balance: account.balance || '0.0000000' }],
+    };
+  }
+
+  /**
+   * Validate a Stellar public key.
+   * @param {string} address
+   * @returns {boolean}
+   */
+  isValidAddress(address) {
+    return typeof address === 'string' && /^G[A-Z2-7]{55}$/.test(address);
+  }
+
+  /**
+   * Return mock account sequence number for an address.
+   * @param {string} address
+   * @returns {Promise<string>}
+   */
+  async getAccountSequence(address) {
+    if (!this.isValidAddress(address)) {
+      throw new ValidationError('Invalid Stellar address');
+    }
+    const account = this.wallets.get(address);
+    if (!account) {
+      throw new NotFoundError('Account not found in mock wallets', ERROR_CODES.WALLET_NOT_FOUND);
+    }
+    return account.sequence || '12345';
+  }
+
+  /**
+   * Convert stroops to XLM.
+   * @param {string|number} stroops
+   * @returns {string}
+   */
+  stroopsToXlm(stroops) {
+    const numberValue = Number(stroops);
+    if (Number.isNaN(numberValue)) {
+      throw new ValidationError('Invalid stroops amount');
+    }
+    return (numberValue / 1e7).toFixed(7);
+  }
+
+  /**
+   * Convert XLM to stroops.
+   * @param {string|number} xlm
+   * @returns {string}
+   */
+  xlmToStroops(xlm) {
+    const numberValue = Number(xlm);
+    if (Number.isNaN(numberValue)) {
+      throw new ValidationError('Invalid XLM amount');
+    }
+    return BigInt(Math.round(numberValue * 1e7)).toString();
+  }
+
+  /**
+   * Build a mock Stellar transaction.
+   * @param {string} sourcePublicKey
+   * @param {Array<Object>} operations
+   * @param {Object} options
+   * @returns {Promise<Object>}
+   */
+  async buildTransaction(sourcePublicKey, operations, options = {}) {
+    if (!this.isValidAddress(sourcePublicKey)) {
+      throw new ValidationError('Invalid source public key');
+    }
+    return {
+      sourcePublicKey,
+      operations: Array.isArray(operations) ? operations : [],
+      options,
+      mockTransactionId: `mock_tx_${crypto.randomBytes(8).toString('hex')}`,
+    };
+  }
+
+  /**
+   * Build a mock payment transaction.
+   * @param {string} sourcePublicKey
+   * @param {string} destinationPublicKey
+   * @param {string|number} amount
+   * @param {Object} options
+   * @returns {Promise<Object>}
+   */
+  async buildPaymentTransaction(sourcePublicKey, destinationPublicKey, amount, options = {}) {
+    if (!this.isValidAddress(sourcePublicKey) || !this.isValidAddress(destinationPublicKey)) {
+      throw new ValidationError('Invalid source or destination public key');
+    }
+
+    return this.buildTransaction(sourcePublicKey, [{
+      type: 'payment',
+      destination: destinationPublicKey,
+      amount: String(amount),
+      asset: options.asset || NATIVE_ASSET,
+    }], options);
+  }
+
+  /**
+   * Sign a mock transaction.
+   * @param {Object} transaction
+   * @param {string} secretKey
+   * @returns {Promise<Object>}
+   */
+  async signTransaction(transaction, secretKey) {
+    if (!transaction || typeof transaction !== 'object') {
+      throw new ValidationError('Invalid transaction');
+    }
+    if (!secretKey || typeof secretKey !== 'string') {
+      throw new ValidationError('Invalid secret key');
+    }
+
+    return {
+      ...transaction,
+      signature: `mock_sign_${crypto.randomBytes(12).toString('hex')}`,
+      signedBy: secretKey,
+      hash: `mock_hash_${crypto.randomBytes(12).toString('hex')}`,
+    };
+  }
+
+  /**
+   * Set a flag to make the next submitTransaction call fail.
+   * @param {boolean} shouldFail
+   * @returns {void}
+   */
+  setSubmitTransactionFailure(shouldFail) {
+    this._submitTransactionShouldFail = Boolean(shouldFail);
+  }
+
+  /**
+   * Submit a mock transaction.
+   * @param {Object} tx
+   * @returns {Promise<Object>}
+   */
+  async submitTransaction(tx) {
+    if (!tx || typeof tx !== 'object') {
+      throw new ValidationError('Invalid transaction');
+    }
+
+    if (this._submitTransactionShouldFail) {
+      this._submitTransactionShouldFail = false;
+      throw new BusinessLogicError(ERROR_CODES.TRANSACTION_FAILED, 'Mock submitTransaction failure');
+    }
+
+    const hash = tx.hash || `mock_submitted_${crypto.randomBytes(12).toString('hex')}`;
+    return {
+      successful: true,
+      hash,
+      ledger: Math.floor(Math.random() * 1000000) + 1,
+      result: 'success',
+    };
+  }
+
+  /**
+   * Return account balances for a mock account.
+   * @param {string} publicKey
+   * @returns {Promise<Object>}
+   */
+  async getAccountBalances(publicKey) {
+    if (!this.isValidAddress(publicKey)) {
+      throw new ValidationError('Invalid public key');
+    }
+    const account = this.wallets.get(publicKey);
+    if (!account) {
+      throw new NotFoundError('Account not found', ERROR_CODES.WALLET_NOT_FOUND);
+    }
+    this._ensureAssetBalances(account);
+    return { balances: [{ asset_type: 'native', balance: account.assetBalances.native }] };
+  }
+
+  /**
+   * Get a mock transaction by hash.
+   * @param {string} transactionHash
+   * @returns {Promise<Object>}
+   */
+  async getTransaction(transactionHash) {
+    if (!transactionHash || typeof transactionHash !== 'string') {
+      throw new ValidationError('Invalid transaction hash');
+    }
+
+    for (const txList of this.transactions.values()) {
+      const tx = txList.find((item) => item.transactionId === transactionHash || item.hash === transactionHash);
+      if (tx) {
+        return tx;
+      }
+    }
+
+    throw new NotFoundError('Transaction not found', ERROR_CODES.TRANSACTION_NOT_FOUND);
+  }
+
   _isRetryableError(error) {
     return Boolean(error && error.details && error.details.retryable);
   }
