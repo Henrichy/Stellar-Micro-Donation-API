@@ -31,13 +31,7 @@ const webhooksRoutes = require('./webhooks');
 const campaignsRoutes = require('./campaigns');
 const offersRoutes = require('./offers');
 const tagsRoutes = require('./tags');
-const { metricsMiddleware, registry } = require('../utils/metrics');
-const requireApiKey = require('../middleware/apiKey');
-const { requireAdmin } = require('../middleware/rbac');
-const authRoutes = require('./auth');
-const exportsRoutes = require('./exports');
-const channelsRoutes = require('./channels');
-const { createGraphQLRouter, attachSubscriptionServer } = require('../graphql');
+const leaderboardRoutes = require('./leaderboard');
 const { errorHandler, notFoundHandler } = require('../middleware/errorHandler');
 const logger = require('../middleware/logger');
 const { attachUserRole } = require('../middleware/rbac');
@@ -191,10 +185,7 @@ app.use('/webhooks', webhooksRoutes);
 app.use('/campaigns', campaignsRoutes);
 app.use('/offers', offersRoutes);
 app.use('/tags', tagsRoutes);
-app.use('/auth', authRoutes);
-app.use('/exports', exportsRoutes);
-app.use('/channels', channelsRoutes);
-app.use('/graphql', createGraphQLRouter());
+app.use('/leaderboard', leaderboardRoutes);
 
 // Exchange rates endpoint
 app.get('/exchange-rates', async (req, res) => {
@@ -469,6 +460,16 @@ async function startServer() {
       const { startCleanup } = require('../utils/replayDetector');
       const replayConfig = require('../config/replayDetection');
       replayCleanupTimer = startCleanup(replayDetectionMiddleware.trackingStore, replayConfig);
+
+      // Initialize Leaderboard SSE for real-time updates
+      try {
+        const LeaderboardSSE = require('../services/LeaderboardSSE');
+        LeaderboardSSE.initLeaderboardSSE();
+      } catch (err) {
+        log.error('APP', 'Failed to initialize LeaderboardSSE', {
+          error: err.message,
+        });
+      }
 
       log.info('APP', 'API started', {
         port: PORT,
