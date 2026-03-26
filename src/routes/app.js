@@ -30,6 +30,7 @@ const webhooksRoutes = require('./webhooks');
 const campaignsRoutes = require('./campaigns');
 const offersRoutes = require('./offers');
 const tagsRoutes = require('./tags');
+const exportsRoutes = require('./exports');
 const channelsRoutes = require('./channels');
 const { createGraphQLRouter, attachSubscriptionServer } = require('../graphql');
 const { errorHandler, notFoundHandler } = require('../middleware/errorHandler');
@@ -172,6 +173,7 @@ app.use('/webhooks', webhooksRoutes);
 app.use('/campaigns', campaignsRoutes);
 app.use('/offers', offersRoutes);
 app.use('/tags', tagsRoutes);
+app.use('/exports', exportsRoutes);
 app.use('/channels', channelsRoutes);
 app.use('/graphql', createGraphQLRouter());
 
