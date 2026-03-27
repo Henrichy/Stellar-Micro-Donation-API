@@ -11,6 +11,7 @@
 
 const express = require('express');
 const helmet = require('helmet');
+const StellarSdk = require('stellar-sdk');
 const config = require('../config');
 const stellarConfig = require('../config/stellar');
 const donationRoutes = require('./donation');
@@ -28,6 +29,8 @@ const dbAdminRoutes = require('./admin/db');
 const retentionAdminRoutes = require('./admin/retention');
 const backupAdminRoutes = require('./admin/backup');
 const matchingProgramsAdminRoutes = require('./admin/matchingPrograms');
+const corporateMatchingAdminRoutes = require('./admin/corporateMatching');
+const corporateMatchingRoutes = require('./corporateMatching');
 const routingAdminRoutes = require('./admin/routing');
 const impactMetricsAdminRoutes = require('./admin/impactMetrics');
 const networkRoutes = require('./network');
@@ -37,7 +40,6 @@ const tiersRoutes = require('./tiers');
 const offersRoutes = require('./offers');
 const tagsRoutes = require('./tags');
 const leaderboardRoutes = require('./leaderboard');
-const encryptionRoutes = require('./encryption');
 const { errorHandler, notFoundHandler } = require('../middleware/errorHandler');
 const logger = require('../middleware/logger');
 const { attachUserRole } = require('../middleware/rbac');
@@ -152,6 +154,9 @@ app.use(express.json({
 }));
 app.use(express.urlencoded({ extended: true }));
 
+// Block check for auto-blocked IPs (early security)
+app.use(require('../middleware/blockCheck'));
+
 // Request/Response logging middleware
 app.use(logger.middleware());
 
@@ -199,6 +204,8 @@ app.use('/admin/db', dbAdminRoutes);
 app.use('/admin/retention', retentionAdminRoutes);
 app.use('/admin', backupAdminRoutes);
 app.use('/admin/matching-programs', matchingProgramsAdminRoutes);
+app.use('/admin/corporate-matching', corporateMatchingAdminRoutes);
+app.use('/corporate-matching', corporateMatchingRoutes);
 app.use('/admin/routing', routingAdminRoutes);
 app.use('/admin/impact-metrics', impactMetricsAdminRoutes);
 app.use('/admin/geo-blocking', require('./admin/geoBlocking'));
@@ -217,6 +224,7 @@ app.use('/tiers', tiersRoutes);
 app.use('/offers', offersRoutes);
 app.use('/tags', tagsRoutes);
 app.use('/leaderboard', leaderboardRoutes);
+app.use('/auth', authRoutes);
 
 // Exchange rates endpoint
 app.get('/exchange-rates', async (req, res) => {
@@ -239,6 +247,24 @@ app.get('/exchange-rates', async (req, res) => {
       error: { code: 'EXCHANGE_RATE_UNAVAILABLE', message: err.message },
     });
   }
+});
+
+// SEP-0010 Stellar TOML discovery endpoint
+app.get('/.well-known/stellar.toml', (req, res) => {
+  const host = req.get('host') || 'localhost';
+  const scheme = req.protocol || 'https';
+  const authServer = `${scheme}://${host}/auth`;
+  const signingKey = process.env.SERVICE_SIGNING_KEY || process.env.SERVICE_SECRET_KEY || process.env.STELLAR_SECRET || '';
+
+  // Minimal SEP-0010 fields
+  const tomlContents = [];
+  tomlContents.push('VERSION = "1.0.0"');
+  tomlContents.push(`AUTH_SERVER = "${authServer}"`);
+  if (signingKey) {
+    tomlContents.push(`SIGNING_KEY = "${StellarSdk.Keypair.fromSecret(signingKey).publicKey()}"`);
+  }
+
+  res.type('text/plain').send(tomlContents.join('\n'));
 });
 
 // Health check endpoint
@@ -277,6 +303,36 @@ app.get('/abuse-signals', require('../middleware/rbac').requireAdmin(), (req, re
     data: abuseDetector.getStats(),
     timestamp: new Date().toISOString()
   });
+});
+
+// Blocked IPs admin endpoints
+app.get('/admin/blocked-ips', require('../middleware/rbac').requireAdmin(), (req, res) => {
+  const abuseDetectionService = require('../services/AbuseDetectionService');
+  res.json({
+    success: true,
+    data: abuseDetectionService.getBlocked(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.delete('/admin/blocked-ips/:ip', require('../middleware/rbac').requireAdmin(), (req, res) => {
+  const abuseDetectionService = require('../services/AbuseDetectionService');
+  const ip = req.params.ip;
+  const unblocked = abuseDetectionService.unblock(ip);
+  if (unblocked) {
+    res.json({
+      success: true,
+      message: 'IP unblocked',
+      ip,
+      timestamp: new Date().toISOString()
+    });
+  } else {
+    res.status(404).json({
+      success: false,
+      error: { code: 'IP_NOT_BLOCKED', message: 'IP not currently blocked' },
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 // Suspicious pattern metrics endpoint (admin only)
@@ -458,7 +514,8 @@ const PORT = config.server.port;
 async function startServer() {
   try {
     await logStartupDiagnostics();
-    await Database.initialize();
+    const { runMigrations } = require('../utils/migrationRunner');
+    await runMigrations();
     await initializeApiKeysTable();
     
     // Initialize feature flags table
@@ -474,6 +531,12 @@ async function startServer() {
     const server = app.listen(PORT, async () => {
       // Attach GraphQL WebSocket subscription server
       attachSubscriptionServer(server);
+
+      // Attach real-time balance streaming WebSocket
+      require('../services/websocketService').attach(server);
+
+      // Start pledge expiry worker
+      require('../workers/expiryWorker').start();
 
       recurringDonationScheduler.start();
       reconciliationService.start();
@@ -556,6 +619,7 @@ async function startServer() {
           recurringDonationScheduler.stop();
           reconciliationService.stop();
           auditLogRetentionService.stop();
+          require('../workers/expiryWorker').stop();
           
           // Stop quota reset job
           if (server.stopQuotaResetJob) {
