@@ -478,6 +478,9 @@ async function startServer() {
       // Attach real-time balance streaming WebSocket
       require('../services/websocketService').attach(server);
 
+      // Start pledge expiry worker
+      require('../workers/expiryWorker').start();
+
       recurringDonationScheduler.start();
       reconciliationService.start();
       auditLogRetentionService.start();
@@ -559,6 +562,7 @@ async function startServer() {
           recurringDonationScheduler.stop();
           reconciliationService.stop();
           auditLogRetentionService.stop();
+          require('../workers/expiryWorker').stop();
           
           // Stop quota reset job
           if (server.stopQuotaResetJob) {
