@@ -11,19 +11,26 @@
 
 const express = require('express');
 const router = express.Router();
+const requireApiKey = require('../middleware/apiKey');
 const { checkPermission, requireAdmin } = require('../middleware/rbac');
 const { PERMISSIONS } = require('../utils/permissions');
 const LimitService = require('../services/LimitService');
 const Database = require('../utils/database');
 const { ValidationError, NotFoundError, ERROR_CODES } = require('../utils/errors');
 const WalletService = require('../services/WalletService');
+const { getStellarService } = require('../config/stellar');
+const log = require('../utils/log');
 const { validateSchema } = require('../middleware/schemaValidation');
 const { parseCursorPaginationQuery } = require('../utils/pagination');
+const { validateDataEntry } = require('../middleware/validateDataEntry');
 // eslint-disable-next-line no-unused-vars
 const { sanitizeLabel, sanitizeName } = require('../utils/sanitizer');
 const { payloadSizeLimiter, ENDPOINT_LIMITS } = require('../middleware/payloadSizeLimiter');
+const { bulkImportRateLimiter } = require('../middleware/rateLimiter');
+const BulkWalletImportService = require('../services/BulkWalletImportService');
 
 const walletService = new WalletService(require('../config/serviceContainer').getStellarService());
+const stellarService = require('../config/serviceContainer').getStellarService();
 const AuditLogService = require('../services/AuditLogService');
 const walletCreateSchema = validateSchema({
   body: {
@@ -172,7 +179,9 @@ router.get('/:id', checkPermission(PERMISSIONS.WALLETS_READ), walletIdSchema, as
     if (!wallet) {
       return res.status(404).json({ success: false, error: 'Wallet not found' });
     }
-    res.json({ success: true, data: wallet });
+    const stellarSvc = getStellarService();
+    const homeDomain = await stellarSvc.getHomeDomain(wallet.address || wallet.publicKey).catch(() => null);
+    res.json({ success: true, data: { ...wallet, homeDomain: homeDomain || null } });
   } catch (error) {
     next(error);
   }
@@ -207,6 +216,62 @@ router.patch('/:id', checkPermission(PERMISSIONS.WALLETS_UPDATE), walletUpdateSc
     });
 
     res.json({ success: true, data: wallet });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * PATCH /wallets/:id/home-domain
+ * Set the home domain on a wallet's Stellar account.
+ * Body: { domain: string, sourceSecret: string }
+ */
+router.patch('/:id/home-domain', checkPermission(PERMISSIONS.WALLETS_UPDATE), walletIdSchema, async (req, res, next) => {
+  try {
+    const { domain, sourceSecret } = req.body;
+
+    if (!domain || !sourceSecret) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: domain, sourceSecret',
+      });
+    }
+
+    const wallet = await walletService.getWalletById(req.params.id);
+    if (!wallet) {
+      return res.status(404).json({ success: false, error: 'Wallet not found' });
+    }
+
+    const stellarSvc = getStellarService();
+    let result;
+    try {
+      result = await stellarSvc.setHomeDomain(sourceSecret, domain);
+    } catch (err) {
+      if (err && err.name === 'ValidationError') {
+        return next(err);
+      }
+      return res.status(502).json({
+        success: false,
+        error: 'Stellar network error while setting home domain',
+      });
+    }
+
+    await AuditLogService.log({
+      category: AuditLogService.CATEGORY.WALLET_OPERATION,
+      action: AuditLogService.ACTION.HOME_DOMAIN_UPDATED,
+      severity: AuditLogService.SEVERITY.MEDIUM,
+      result: 'SUCCESS',
+      userId: req.user && req.user.id,
+      requestId: req.id,
+      ipAddress: req.ip,
+      resource: `/wallets/${req.params.id}/home-domain`,
+      details: { walletId: req.params.id, homeDomain: domain, txHash: result.hash },
+    });
+
+    return res.json({
+      success: true,
+      data: { homeDomain: domain },
+    });
   } catch (error) {
     next(error);
   }
@@ -467,5 +532,351 @@ router.get('/:publicKey/transactions', checkPermission(PERMISSIONS.WALLETS_READ)
     next(error);
   }
 });
+
+/**
+ * POST /wallets/:id/data
+ * Create or update a data entry on the wallet's Stellar account
+ * Body: { secretKey, key, value }
+ * 
+ * SECURITY WARNING: Data entries are publicly readable on-chain.
+ * Do not store PII, secrets, or sensitive information.
+ */
+router.post('/:id/data', 
+  checkPermission(PERMISSIONS.WALLETS_UPDATE), 
+  walletIdSchema,
+  validateDataEntry,
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      const { secretKey, key, value } = req.body;
+
+      if (!secretKey) {
+        throw new ValidationError(
+          'Secret key is required to set data entries',
+          null,
+          ERROR_CODES.MISSING_REQUIRED_FIELD
+        );
+      }
+
+      const result = await walletService.setAccountData(id, secretKey, key, value);
+
+      await AuditLogService.log({
+        category: AuditLogService.CATEGORY.WALLET_OPERATION,
+        action: 'DATA_ENTRY_SET',
+        severity: AuditLogService.SEVERITY.MEDIUM,
+        result: 'SUCCESS',
+        userId: req.user && req.user.id,
+        requestId: req.id,
+        ipAddress: req.ip,
+        resource: `/wallets/${id}/data`,
+        details: { walletId: id, key, txHash: result.hash }
+      });
+
+      res.status(201).json({
+        success: true,
+        data: {
+          hash: result.hash,
+          ledger: result.ledger
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /wallets/:id/data
+ * Fetch all current data entries for a wallet from the Stellar network
+ */
+router.get('/:id/data',
+  checkPermission(PERMISSIONS.WALLETS_READ),
+  walletIdSchema,
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+
+      const result = await walletService.getAccountData(id);
+
+      res.json({
+        success: true,
+        data: result.entries || {},
+        count: Object.keys(result.entries || {}).length
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * DELETE /wallets/:id/data/:key
+ * Remove a specific data entry from the wallet's Stellar account
+ * Body: { secretKey }
+ * 
+ * Deletion is done by setting the value to null in a manageData operation.
+ */
+router.delete('/:id/data/:key',
+  checkPermission(PERMISSIONS.WALLETS_UPDATE),
+  async (req, res, next) => {
+    try {
+      const { id, key } = req.params;
+      const { secretKey } = req.body;
+
+      // Validate wallet ID
+      const walletId = parseInt(id, 10);
+      if (isNaN(walletId) || walletId < 1) {
+        throw new ValidationError('Invalid wallet ID', null, ERROR_CODES.INVALID_REQUEST);
+      }
+
+      if (!secretKey) {
+        throw new ValidationError(
+          'Secret key is required to delete data entries',
+          null,
+          ERROR_CODES.MISSING_REQUIRED_FIELD
+        );
+      }
+
+      if (!key) {
+        throw new ValidationError(
+          'Data entry key is required',
+          null,
+          ERROR_CODES.MISSING_REQUIRED_FIELD
+        );
+      }
+
+      const result = await walletService.deleteAccountData(walletId, secretKey, key);
+
+      await AuditLogService.log({
+        category: AuditLogService.CATEGORY.WALLET_OPERATION,
+        action: 'DATA_ENTRY_DELETED',
+        severity: AuditLogService.SEVERITY.MEDIUM,
+        result: 'SUCCESS',
+        userId: req.user && req.user.id,
+        requestId: req.id,
+        ipAddress: req.ip,
+        resource: `/wallets/${id}/data/${key}`,
+        details: { walletId: id, key, txHash: result.hash }
+      });
+
+      res.json({
+        success: true,
+        data: {
+          hash: result.hash,
+          ledger: result.ledger
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+ * POST /wallets/:id/merge
+ * Merge a wallet into a destination account.
+ *
+ * Transfers all XLM from the source wallet to the destination, closes the
+ * source account on the Stellar network, and soft-deletes the wallet record.
+ *
+ * @requires wallets:delete permission
+ * @body {string}  destinationPublicKey - Stellar public key of the receiving account
+ * @body {string}  sourceSecret         - Secret key of the wallet being merged
+ * @body {boolean} confirm              - Must be exactly `true` to proceed
+ */
+router.post('/:id/merge', checkPermission(PERMISSIONS.WALLETS_DELETE), async (req, res, next) => {
+  try {
+    const { destinationPublicKey, sourceSecret, confirm } = req.body;
+
+    // ── Confirmation gate ────────────────────────────────────────────────────
+    if (confirm !== true) {
+      return res.status(400).json({
+        success: false,
+        error: 'Account merge requires explicit confirmation. Set confirm: true to proceed.',
+      });
+    }
+
+    // ── Required fields ──────────────────────────────────────────────────────
+    if (!destinationPublicKey || !sourceSecret) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: destinationPublicKey, sourceSecret',
+      });
+    }
+
+    // ── Lookup source wallet ─────────────────────────────────────────────────
+    const sourceWallet = await Database.get(
+      'SELECT id, publicKey, mergedAt FROM users WHERE id = ?',
+      [req.params.id]
+    );
+
+    if (!sourceWallet) {
+      return res.status(404).json({ success: false, error: 'Wallet not found' });
+    }
+
+    if (sourceWallet.mergedAt) {
+      return res.status(409).json({
+        success: false,
+        error: 'Wallet has already been merged and closed',
+      });
+    }
+
+    if (sourceWallet.publicKey === destinationPublicKey) {
+      return res.status(400).json({
+        success: false,
+        error: 'Source and destination wallets cannot be the same',
+      });
+    }
+
+    // ── Execute merge on Stellar ─────────────────────────────────────────────
+    const stellarService = getStellarService();
+    const mergeResult = await stellarService.mergeAccount(sourceSecret, destinationPublicKey);
+
+    // ── Soft-delete source wallet ────────────────────────────────────────────
+    const now = new Date().toISOString();
+    await Database.run(
+      'UPDATE users SET mergedAt = ?, mergedInto = ? WHERE id = ?',
+      [now, destinationPublicKey, sourceWallet.id]
+    );
+
+    // ── Write audit log ──────────────────────────────────────────────────────
+    await Database.run(
+      `INSERT INTO wallet_merge_audit
+         (sourceWalletId, sourcePublicKey, destinationPublicKey, mergedAmount,
+          transactionHash, ledger, performedBy, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        sourceWallet.id,
+        sourceWallet.publicKey,
+        destinationPublicKey,
+        mergeResult.mergedAmount,
+        mergeResult.hash,
+        mergeResult.ledger,
+        req.user ? req.user.id : 'unknown',
+        now,
+      ]
+    );
+
+    log.info('WALLET_ROUTE', 'Wallet merged', {
+      sourceId: sourceWallet.id,
+      sourcePublicKey: sourceWallet.publicKey,
+      destinationPublicKey,
+      hash: mergeResult.hash,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Account merged successfully. Source account has been closed.',
+      data: {
+        sourceWalletId: sourceWallet.id,
+        sourcePublicKey: sourceWallet.publicKey,
+        destinationPublicKey,
+        mergedAmount: mergeResult.mergedAmount,
+        transactionHash: mergeResult.hash,
+        ledger: mergeResult.ledger,
+        mergedAt: now,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /wallets/:id/certificates
+ * Return all donation certificate NFTs held by a wallet.
+ * Queries Horizon (or mock) for CERT-prefixed assets on the wallet's Stellar account.
+ */
+router.get('/:id/certificates', checkPermission(PERMISSIONS.WALLETS_READ), walletIdSchema, async (req, res, next) => {
+  try {
+    const wallet = await walletService.getWalletById(req.params.id);
+    if (!wallet) {
+      return res.status(404).json({ success: false, error: 'Wallet not found' });
+    }
+
+    const stellarSvc = getStellarService();
+    const certificates = await stellarSvc.getCertificatesForWallet(wallet.address || wallet.publicKey);
+
+    res.json({
+      success: true,
+      data: certificates,
+      count: certificates.length,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+ * POST /wallets/bulk-import
+ * Import multiple existing Stellar wallets in a single request.
+ * Middleware chain: requireApiKey → bulkImportRateLimiter → Content-Type check →
+ *   batch size validation → checkPermission(WALLETS_CREATE)
+ */
+router.post(
+  '/bulk-import',
+  requireApiKey,
+  bulkImportRateLimiter,
+  (req, res, next) => {
+    const contentType = req.headers['content-type'] || '';
+    if (!contentType.includes('application/json')) {
+      return res.status(415).json({
+        success: false,
+        error: {
+          code: 'UNSUPPORTED_MEDIA_TYPE',
+          message: 'Content-Type must be application/json'
+        }
+      });
+    }
+    next();
+  },
+  (req, res, next) => {
+    const wallets = req.body && req.body.wallets;
+    if (!Array.isArray(wallets) || wallets.length === 0) {
+      return res.status(422).json({
+        success: false,
+        error: {
+          code: 'INVALID_BATCH',
+          message: 'wallets array must not be empty'
+        }
+      });
+    }
+    if (wallets.length > 100) {
+      return res.status(422).json({
+        success: false,
+        error: {
+          code: 'BATCH_TOO_LARGE',
+          message: `Batch size limit exceeded: maximum 100 wallets per request, got ${wallets.length}`
+        }
+      });
+    }
+    next();
+  },
+  checkPermission(PERMISSIONS.WALLETS_CREATE),
+  async (req, res, next) => {
+    try {
+      const { wallets } = req.body;
+      const bulkImportService = new BulkWalletImportService(walletService, stellarService);
+      const { results, summary } = await bulkImportService.importBatch(wallets, req.apiKey.id);
+
+      await AuditLogService.log({
+        category: AuditLogService.CATEGORY.WALLET_OPERATION,
+        action: AuditLogService.ACTION.BULK_WALLET_IMPORT,
+        severity: AuditLogService.SEVERITY.MEDIUM,
+        result: 'SUCCESS',
+        userId: req.apiKey.id,
+        requestId: req.id,
+        ipAddress: req.ip,
+        resource: '/wallets/bulk-import',
+        details: {
+          batchSize: wallets.length,
+          succeeded: summary.succeeded,
+          duplicates: summary.duplicates,
+          failed: summary.failed
+        }
+      });
+
+      return res.status(200).json({ results, summary });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 module.exports = router;

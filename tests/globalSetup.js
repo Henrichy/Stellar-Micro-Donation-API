@@ -39,10 +39,16 @@ module.exports = async () => {
       receiverId INTEGER NOT NULL,
       amount REAL NOT NULL,
       memo TEXT,
+      notes TEXT,
+      tags TEXT,
       timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      deleted_at DATETIME DEFAULT NULL,
       idempotencyKey TEXT UNIQUE,
       stellar_tx_id TEXT UNIQUE,
-      is_orphan INTEGER NOT NULL DEFAULT 0
+      is_orphan INTEGER NOT NULL DEFAULT 0,
+      campaign_id INTEGER,
+      validAfter INTEGER DEFAULT 0,
+      validBefore INTEGER DEFAULT 0
     )`);
     await Database.run(`CREATE TABLE IF NOT EXISTS api_keys (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,7 +68,9 @@ module.exports = async () => {
       rotated_to_id INTEGER,
       signing_required INTEGER NOT NULL DEFAULT 0,
       key_secret TEXT,
-      allowed_ips TEXT
+      allowed_ips TEXT,
+      notification_email TEXT,
+      last_expiry_notification_sent_at INTEGER
     )`);
     await Database.run(`CREATE TABLE IF NOT EXISTS student_fees (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -19,6 +19,7 @@ const { STELLAR_NETWORKS, HORIZON_URLS } = require('../constants');
 const StellarErrorHandler = require('../utils/stellarErrorHandler');
 const log = require('../utils/log');
 const { withTimeout, TIMEOUT_DEFAULTS, TimeoutError } = require('../utils/timeoutHandler');
+const { CircuitBreaker } = require('../utils/circuitBreaker');
 const {
   toStellarSdkAsset,
   normalizeHorizonAsset,
@@ -55,6 +56,14 @@ class StellarService extends StellarServiceInterface {
       submit: config.submitTimeout || TIMEOUT_DEFAULTS.STELLAR_SUBMIT,
       stream: config.streamTimeout || TIMEOUT_DEFAULTS.STELLAR_STREAM,
     };
+
+    // Circuit breaker — protects all Horizon API calls
+    this.circuitBreaker = new CircuitBreaker({
+      failureThreshold: config.circuitBreakerThreshold ?? 5,
+      windowMs: config.circuitBreakerWindowMs ?? 60_000,
+      cooldownMs: config.circuitBreakerCooldownMs ?? 30_000,
+      name: 'horizon',
+    });
   }
 
   getNetwork() {
@@ -156,7 +165,10 @@ class StellarService extends StellarServiceInterface {
   }
 
   /**
-   * Execute an operation with automatic retry on transient errors and timeout
+   * Execute an operation with automatic retry on transient errors and timeout.
+   * All calls are wrapped by the circuit breaker — if Horizon is down the
+   * circuit opens and subsequent calls fail fast without hitting the network.
+   *
    * @private
    * @param {Function} operation - Async operation to execute
    * @param {string} operationName - Name of operation for logging
@@ -171,8 +183,17 @@ class StellarService extends StellarServiceInterface {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        return await withTimeout(operation(), timeoutMs, operationName);
+        // Each attempt goes through the circuit breaker so that failures are
+        // counted and the circuit can open mid-retry if the threshold is hit.
+        return await this.circuitBreaker.execute(() =>
+          withTimeout(operation(), timeoutMs, operationName)
+        );
       } catch (error) {
+        // Fast-fail immediately when the circuit is open — no retries
+        if (error.circuitOpen) {
+          throw error;
+        }
+
         lastError = error;
 
         // Log timeout errors
@@ -419,6 +440,43 @@ class StellarService extends StellarServiceInterface {
   }
 
   /**
+   * Bump an account's sequence number to a specific value.
+   * Submits a BumpSequence operation signed by the account's secret key.
+   * Useful for invalidating pre-signed transactions (time-locked escrow, etc.).
+   *
+   * @param {string} secret - Secret key of the account to bump
+   * @param {string|number} bumpTo - Target sequence number (must be > current)
+   * @returns {Promise<{hash: string, ledger: number, newSequence: string}>}
+   */
+  async bumpSequence(secret, bumpTo) {
+    return StellarErrorHandler.wrap(async () => {
+      const keypair = StellarSdk.Keypair.fromSecret(secret);
+      const account = await withTimeout(
+        this.server.loadAccount(keypair.publicKey()),
+        this.timeouts.api,
+        'loadAccount timed out'
+      );
+
+      const tx = new StellarSdk.TransactionBuilder(account, {
+        fee: this.baseFee,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(StellarSdk.Operation.bumpSequence({ bumpTo: String(bumpTo) }))
+        .setTimeout(30)
+        .build();
+
+      tx.sign(keypair);
+
+      const result = await this._submitTransactionWithNetworkSafety(tx);
+      return {
+        hash: result.hash,
+        ledger: result.ledger,
+        newSequence: String(bumpTo),
+      };
+    }, 'bumpSequence');
+  }
+
+  /**
    * Send a donation transaction
    * @param {Object} params
    * @param {string} params.sourceSecret - Source account secret key
@@ -427,7 +485,7 @@ class StellarService extends StellarServiceInterface {
    * @param {string} [params.memo] - Optional transaction memo (max 28 bytes)
    * @returns {Promise<{transactionId: string, ledger: number}>}
    */
-  async sendDonation({ sourceSecret, destinationPublic, amount, memo = '', memoType = 'text', asset = null }) {
+  async sendDonation({ sourceSecret, destinationPublic, amount, memo = '', memoType = 'text', asset = null, validAfter = 0, validBefore = 0 }) {
     return StellarErrorHandler.wrap(async () => {
       const sourceKeypair = StellarSdk.Keypair.fromSecret(sourceSecret);
       const sourceAccount = await this._executeWithRetry(
@@ -436,9 +494,19 @@ class StellarService extends StellarServiceInterface {
       );
       const paymentAsset = asset ? toStellarSdkAsset(asset) : StellarSdk.Asset.native();
 
+      // Configure time bounds
+      // In Stellar, 0 means no limit (infinite)
+      // validAfter (minTime) = 0 means minimum time is not restricted
+      // validBefore (maxTime) = 0 means maximum time is not restricted
+      const timebounds = {
+        minTime: String(validAfter || '0'), 
+        maxTime: String(validBefore || '0')
+      };
+
       const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
         fee: this.baseFee,
         networkPassphrase: this.networkPassphrase,
+        timebounds,
       })
         .addOperation(StellarSdk.Operation.payment({
           destination: destinationPublic,
@@ -782,347 +850,920 @@ class StellarService extends StellarServiceInterface {
   }
 
   /**
-   * Create a claimable balance on the Stellar network.
+   * Merge a source account into a destination account.
    *
-   * @param {Object} params
-   * @param {string} params.sourceSecret - Funding account secret key
-   * @param {string} params.amount - Amount in XLM
-   * @param {Array<{destination: string, predicate?: Object}>} params.claimants - Claimants list
-   * @param {Object} [params.predicate] - Optional time-based predicate (notBefore/notAfter ms timestamps)
-   * @returns {Promise<{balanceId: string, transactionId: string, ledger: number}>}
+   * Transfers all XLM from the source account to the destination and closes
+   * the source account on the Stellar network (account merge operation).
+   *
+   * @param {string} sourceSecret      - Secret key of the account to merge (close)
+   * @param {string} destinationPublic - Public key of the account to receive all funds
+   * @returns {Promise<{hash: string, ledger: number, mergedAmount: string}>}
+   * @throws {ValidationError}     If keys are invalid or accounts are the same
+   * @throws {NotFoundError}       If destination account does not exist
+   * @throws {BusinessLogicError}  If the Stellar operation fails
    */
-  async createClaimableBalance({ sourceSecret, amount, claimants, predicate = null }) {
+  async mergeAccount(sourceSecret, destinationPublic) {
     return StellarErrorHandler.wrap(async () => {
       const sourceKeypair = StellarSdk.Keypair.fromSecret(sourceSecret);
-      const sourceAccount = await this._executeWithRetry(
-        () => this.server.loadAccount(sourceKeypair.publicKey()),
-        'loadAccountForClaimableBalance'
+      const sourcePublic = sourceKeypair.publicKey();
+
+      if (sourcePublic === destinationPublic) {
+        const { ValidationError } = require('../utils/errors');
+        throw new ValidationError('Source and destination accounts cannot be the same');
+      }
+
+      const sourceAccount = await this._executeWithRetry(() =>
+        this.server.loadAccount(sourcePublic)
       );
 
-      const networkPassphrase = this.networkPassphrase;
+      // Verify destination exists
+      await this._executeWithRetry(() =>
+        this.server.loadAccount(destinationPublic)
+      );
 
-      const stellarClaimants = claimants.map(c => {
-        let stellarPredicate = StellarSdk.Claimant.predicateUnconditional();
-        const p = c.predicate || predicate;
-        if (p) {
-          const preds = [];
-          if (p.notBefore) {
-            preds.push(StellarSdk.Claimant.predicateNot(
-              StellarSdk.Claimant.predicateBeforeAbsoluteTime(
-                Math.floor(p.notBefore / 1000).toString()
-              )
-            ));
-          }
-          if (p.notAfter) {
-            preds.push(StellarSdk.Claimant.predicateBeforeAbsoluteTime(
-              Math.floor(p.notAfter / 1000).toString()
-            ));
-          }
-          if (preds.length === 1) stellarPredicate = preds[0];
-          else if (preds.length === 2) stellarPredicate = StellarSdk.Claimant.predicateAnd(...preds);
-        }
-        return new StellarSdk.Claimant(c.destination, stellarPredicate);
+      const nativeBal = sourceAccount.balances.find(b => b.asset_type === 'native');
+      const mergedAmount = nativeBal ? nativeBal.balance : '0';
+
+      const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+        fee: StellarSdk.BASE_FEE,
+        networkPassphrase:
+          this.network === 'public'
+            ? StellarSdk.Networks.PUBLIC
+            : StellarSdk.Networks.TESTNET,
+      })
+        .addOperation(
+          StellarSdk.Operation.accountMerge({ destination: destinationPublic })
+        )
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(sourceKeypair);
+
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+
+      log.info('STELLAR_SERVICE', 'Account merged', {
+        source: sourcePublic,
+        destination: destinationPublic,
+        mergedAmount,
+        hash: result.hash,
       });
 
-      const tx = new StellarSdk.TransactionBuilder(sourceAccount, {
-        fee: this.baseFee,
-        networkPassphrase,
+      return { hash: result.hash, ledger: result.ledger, mergedAmount };
+    }, 'mergeAccount');
+  }
+
+  /**
+   * Issue a custom Stellar asset to a recipient.
+   *
+   * Flow:
+   *  1. Recipient must have an existing trustline for the asset (changeTrust op).
+   *  2. Issuer sends a payment of the custom asset to the recipient.
+   *
+   * @param {string} issuerSecret   - Secret key of the asset issuer account
+   * @param {string} assetCode      - Asset code (1-12 alphanumeric characters)
+   * @param {string} amount         - Amount to issue (string, 7 decimal places)
+   * @param {string} recipientPublic - Public key of the recipient
+   * @returns {Promise<{hash: string, ledger: number, assetCode: string, issuerPublic: string, amount: string}>}
+   * @throws {ValidationError}    If inputs are invalid
+   * @throws {BusinessLogicError} If the Stellar operation fails
+   */
+  async issueAsset(issuerSecret, assetCode, amount, recipientPublic) {
+    return StellarErrorHandler.wrap(async () => {
+      const { ValidationError } = require('../utils/errors');
+
+      if (!assetCode || !/^[A-Za-z0-9]{1,12}$/.test(assetCode)) {
+        throw new ValidationError('Asset code must be 1-12 alphanumeric characters');
+      }
+
+      const issuerKeypair = StellarSdk.Keypair.fromSecret(issuerSecret);
+      const issuerPublic = issuerKeypair.publicKey();
+
+      if (issuerPublic === recipientPublic) {
+        throw new ValidationError('Issuer and recipient cannot be the same account');
+      }
+
+      const asset = new StellarSdk.Asset(assetCode, issuerPublic);
+
+      const issuerAccount = await this._executeWithRetry(() =>
+        this.server.loadAccount(issuerPublic)
+      );
+
+      const transaction = new StellarSdk.TransactionBuilder(issuerAccount, {
+        fee: StellarSdk.BASE_FEE,
+        networkPassphrase:
+          this.network === 'public'
+            ? StellarSdk.Networks.PUBLIC
+            : StellarSdk.Networks.TESTNET,
       })
-        .addOperation(StellarSdk.Operation.createClaimableBalance({
-          asset: StellarSdk.Asset.native(),
+        .addOperation(StellarSdk.Operation.payment({
+          destination: recipientPublic,
+          asset,
           amount: amount.toString(),
-          claimants: stellarClaimants,
         }))
         .setTimeout(30)
         .build();
 
-      tx.sign(sourceKeypair);
-      const result = await this._submitTransactionWithNetworkSafety(tx);
+      transaction.sign(issuerKeypair);
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
 
-      // Extract balance ID from operation result
-      const opResult = result.result_meta_xdr
-        ? StellarSdk.xdr.TransactionMeta.fromXDR(result.result_meta_xdr, 'base64')
-        : null;
-      let balanceId = null;
-      if (opResult) {
-        try {
-          const ops = opResult.v2().operations();
-          if (ops && ops[0]) {
-            const inner = ops[0].changes();
-            for (const change of inner) {
-              if (change.switch().name === 'ledgerEntryCreated') {
-                const entry = change.created().data();
-                if (entry.switch().name === 'claimableBalance') {
-                  balanceId = StellarSdk.StrKey.encodeClaimableBalance(
-                    entry.claimableBalance().balanceId().toXDR()
-                  );
-                }
-              }
-            }
-          }
-        } catch (_) { /* balanceId stays null if XDR parsing fails */ }
-      }
+      log.info('STELLAR_SERVICE', 'Asset issued', {
+        assetCode, issuerPublic, recipientPublic, amount, hash: result.hash,
+      });
 
-      return { balanceId, transactionId: result.hash, ledger: result.ledger };
-    }, 'createClaimableBalance');
+      return { hash: result.hash, ledger: result.ledger, assetCode, issuerPublic, amount };
+    }, 'issueAsset');
   }
 
   /**
-   * Merge multiple partially-signed XDR envelopes and submit to Stellar.
+   * Burn a custom Stellar asset by sending it back to the issuer.
    *
-   * Each entry in `signatures` must contain a `signed_xdr` field that is a
-   * base-64 XDR TransactionEnvelope already signed by one signer.  The method
-   * collects all signatures from those envelopes, attaches them to the base
-   * transaction, and submits the result.
-   *
-   * @param {Object}   params
-   * @param {string}   params.transaction_xdr    - Base-64 XDR of the unsigned transaction
-   * @param {string}   params.network_passphrase - Stellar network passphrase
-   * @param {Object[]} params.signatures         - [{signer, signed_xdr}]
-   * @returns {Promise<{transactionId: string, ledger: number}>}
+   * @param {string} holderSecret   - Secret key of the current asset holder
+   * @param {string} assetCode      - Asset code to burn
+   * @param {string} issuerPublic   - Public key of the asset issuer
+   * @param {string} amount         - Amount to burn
+   * @returns {Promise<{hash: string, ledger: number, assetCode: string, amount: string}>}
+   * @throws {ValidationError}    If inputs are invalid
+   * @throws {BusinessLogicError} If the Stellar operation fails
    */
-  async submitMultiSigTransaction({ transaction_xdr, network_passphrase, signatures }) {
+  async burnAsset(holderSecret, assetCode, issuerPublic, amount) {
     return StellarErrorHandler.wrap(async () => {
-      const baseTx = new StellarSdk.Transaction(transaction_xdr, network_passphrase);
+      const { ValidationError } = require('../utils/errors');
 
-      for (const { signed_xdr } of signatures) {
-        const signedTx = new StellarSdk.Transaction(signed_xdr, network_passphrase);
-        for (const sig of signedTx.signatures) {
-          baseTx.signatures.push(sig);
-        }
+      if (!assetCode || !/^[A-Za-z0-9]{1,12}$/.test(assetCode)) {
+        throw new ValidationError('Asset code must be 1-12 alphanumeric characters');
       }
 
-      const result = await this._submitTransactionWithNetworkSafety(baseTx);
-      return { transactionId: result.hash, ledger: result.ledger };
-    }, 'submitMultiSigTransaction');
+      const holderKeypair = StellarSdk.Keypair.fromSecret(holderSecret);
+      const holderPublic = holderKeypair.publicKey();
+
+      if (holderPublic === issuerPublic) {
+        throw new ValidationError('Holder and issuer cannot be the same account');
+      }
+
+      const asset = new StellarSdk.Asset(assetCode, issuerPublic);
+
+      const holderAccount = await this._executeWithRetry(() =>
+        this.server.loadAccount(holderPublic)
+      );
+
+      const transaction = new StellarSdk.TransactionBuilder(holderAccount, {
+        fee: StellarSdk.BASE_FEE,
+        networkPassphrase:
+          this.network === 'public'
+            ? StellarSdk.Networks.PUBLIC
+            : StellarSdk.Networks.TESTNET,
+      })
+        .addOperation(StellarSdk.Operation.payment({
+          destination: issuerPublic,
+          asset,
+          amount: amount.toString(),
+        }))
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(holderKeypair);
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+
+      log.info('STELLAR_SERVICE', 'Asset burned', {
+        assetCode, issuerPublic, holderPublic, amount, hash: result.hash,
+      });
+
+      return { hash: result.hash, ledger: result.ledger, assetCode, amount };
+    }, 'burnAsset');
+  }
+
+
+  /**
+   * Get the home domain for a Stellar account.
+   *
+   * @param {string} publicKey - Public key of the account to query
+   * @returns {Promise<string|null>} The home_domain field, or null if unset or on error
+   */
+  async getHomeDomain(publicKey) {
+    try {
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(publicKey),
+        'loadAccountForHomeDomain'
+      );
+      return account.home_domain || null;
+    } catch (error) {
+      return null;
+    }
   }
 
   /**
-   * Create a DEX offer to buy or sell an asset on the Stellar network.
+   * Set the home domain for a Stellar account.
    *
-   * @param {Object} params
-   * @param {string} params.sourceSecret - Source account secret key
-   * @param {string} params.sellingAsset - Asset being sold ('XLM' or 'CODE:ISSUER')
-   * @param {string} params.buyingAsset  - Asset being bought ('XLM' or 'CODE:ISSUER')
-   * @param {string} params.amount       - Amount of selling asset to offer
-   * @param {string} params.price        - Price as a ratio string 'n/d' or decimal string
-   * @param {number} [params.offerId=0]  - 0 to create new offer; existing ID to update
-   * @returns {Promise<{offerId: number, transactionId: string, ledger: number}>}
+   * NOTE: stellar.toml is verified at https://<domain>/.well-known/stellar.toml
+   * before the transaction is submitted. The domain must serve a valid stellar.toml
+   * (2xx response within 5 seconds) or this method will throw a ValidationError.
+   *
+   * @param {string} sourceSecret - Secret key of the source account
+   * @param {string} domain - Hostname to set as home domain (no protocol, no path, max 32 chars)
+   * @returns {Promise<{hash: string, ledger: number}>}
+   * @throws {ValidationError} If domain format is invalid or stellar.toml is unreachable/non-2xx
+   * @throws {BusinessLogicError} If the Stellar network rejects the transaction
    */
-  async createOffer({ sourceSecret, sellingAsset, buyingAsset, amount, price, offerId = 0 }) {
+  async setHomeDomain(sourceSecret, domain) {
+    const { ValidationError } = require('../utils/errors');
+    const https = require('https');
+
+    // Validate domain: hostname only, no protocol, no path, max 32 chars
+    if (!domain || typeof domain !== 'string') {
+      throw new ValidationError('domain must be a non-empty string');
+    }
+    if (domain.length > 32) {
+      throw new ValidationError('domain must be 32 characters or fewer per Stellar spec');
+    }
+    if (!/^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$/.test(domain)) {
+      throw new ValidationError('domain must be a valid hostname with no protocol or path');
+    }
+
+    // Verify stellar.toml exists and returns 2xx within 5 seconds
+    await new Promise((resolve, reject) => {
+      const url = `https://${domain}/.well-known/stellar.toml`;
+      const req = https.get(url, { timeout: 5000 }, (res) => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          res.resume();
+          resolve();
+        } else {
+          res.resume();
+          reject(new ValidationError(
+            `stellar.toml verification failed: https://${domain}/.well-known/stellar.toml returned HTTP ${res.statusCode}`
+          ));
+        }
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new ValidationError(
+          `stellar.toml verification failed: request to https://${domain}/.well-known/stellar.toml timed out after 5 seconds`
+        ));
+      });
+      req.on('error', (err) => {
+        reject(new ValidationError(
+          `stellar.toml verification failed: could not reach https://${domain}/.well-known/stellar.toml — ${err.message}`
+        ));
+      });
+    });
+
     return StellarErrorHandler.wrap(async () => {
       const sourceKeypair = StellarSdk.Keypair.fromSecret(sourceSecret);
       const sourceAccount = await this._executeWithRetry(
         () => this.server.loadAccount(sourceKeypair.publicKey()),
-        'loadAccountForOffer'
+        'loadAccountForSetHomeDomain'
       );
 
-      const parseAsset = (assetStr) => {
-        if (assetStr === 'XLM' || assetStr === 'native') return StellarSdk.Asset.native();
-        const [code, issuer] = assetStr.split(':');
-        if (!issuer) throw new Error(`Invalid asset format: ${assetStr}. Use 'XLM' or 'CODE:ISSUER'`);
-        return new StellarSdk.Asset(code, issuer);
-      };
-
-      const parsePrice = (p) => {
-        if (typeof p === 'string' && p.includes('/')) {
-          const [n, d] = p.split('/');
-          return { n: parseInt(n, 10), d: parseInt(d, 10) };
-        }
-        // Convert decimal to fraction
-        const dec = parseFloat(p);
-        return { n: Math.round(dec * 10000000), d: 10000000 };
-      };
-
-      const tx = new StellarSdk.TransactionBuilder(sourceAccount, {
+      const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
         fee: this.baseFee,
         networkPassphrase: this.networkPassphrase,
       })
-        .addOperation(StellarSdk.Operation.manageSellOffer({
-          selling: parseAsset(sellingAsset),
-          buying: parseAsset(buyingAsset),
-          amount: amount.toString(),
-          price: parsePrice(price),
-          offerId: offerId.toString(),
+        .addOperation(StellarSdk.Operation.setOptions({ homeDomain: domain }))
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(sourceKeypair);
+
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+
+      log.info('STELLAR_SERVICE', 'Home domain set', {
+        source: sourceKeypair.publicKey(),
+        homeDomain: domain,
+        hash: result.hash,
+      });
+
+      return { hash: result.hash, ledger: result.ledger };
+    }, 'setHomeDomain');
+  }
+
+  /**
+   * Query Horizon for an account and normalise the outcome into a discriminated union.
+   *
+   * This method never throws — all outcomes are returned as plain values so callers
+   * do not need to inspect raw Horizon error shapes.
+   *
+   * @param {string} publicKey - Stellar public key to look up
+   * @returns {Promise<
+   *   { balance: string } |
+   *   { notFound: true } |
+   *   { error: true }
+   * >}
+   *   - `{ balance }` — account exists; `balance` is the native XLM balance string
+   *   - `{ notFound: true }` — Horizon returned 404 (account not yet funded)
+   *   - `{ error: true }` — any other Horizon or network error
+   */
+  async getAccountInfo(publicKey) {
+    try {
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(publicKey),
+        'getAccountInfo'
+      );
+      const nativeBalance = account.balances.find(b => b.asset_type === 'native');
+      return { balance: nativeBalance ? nativeBalance.balance : '0' };
+    } catch (error) {
+      const status = error && error.response && error.response.status;
+      if (status === 404) {
+        return { notFound: true };
+      }
+      log.warn('STELLAR_SERVICE', 'getAccountInfo failed with non-404 error', {
+        publicKey,
+        status,
+        error: error.message,
+      });
+      return { error: true };
+    }
+  }
+
+  /**
+   * Get the inflation destination for a Stellar account.
+   *
+   * @param {string} publicKey - Public key of the account to query
+   * @returns {Promise<string|null>} The inflation_destination field, or null if unset or on error
+   */
+  async getInflationDestination(publicKey) {
+    try {
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(publicKey),
+        'loadAccountForInflationDestination'
+      );
+      return account.inflation_destination || null;
+    } catch (error) {
+      log.warn('STELLAR_SERVICE', 'Failed to fetch inflation destination, returning null', {
+        publicKey,
+        error: error.message,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Simulate (dry-run) a Stellar transaction without submitting it to the network.
+   *
+   * This method decodes the provided XDR, fetches current fee stats from Horizon
+   * (read-only), and returns an estimated fee and expected operation outcome.
+   *
+   * IMPORTANT: This method NEVER calls `server.submitTransaction`,
+   * `server.submitAsyncTransaction`, or any equivalent Horizon submission endpoint.
+   * No transaction is broadcast to the Stellar network.
+   *
+   * @param {string} xdr - Base64-encoded Stellar transaction envelope XDR
+   * @returns {Promise<{
+   *   success: boolean,
+   *   estimatedFee?: { stroops: number, xlm: string },
+   *   estimatedResult?: { operationType: string, sourceAccount: string|null, destinationAccount: string|null },
+   *   feeWarning?: string,
+   *   errors?: string[],
+   *   simulatedAt: string
+   * }>} Simulation_Result — never throws for expected failure modes
+   */
+  async simulateTransaction(xdr) {
+    const simulatedAt = new Date().toISOString();
+
+    // Guard: xdr must be a non-empty string
+    if (!xdr || typeof xdr !== 'string') {
+      return { success: false, errors: ['xdr is required'], simulatedAt };
+    }
+
+    // Decode the XDR locally — no network call
+    let tx;
+    try {
+      tx = StellarSdk.TransactionBuilder.fromXDR(xdr, this.networkPassphrase);
+    } catch (parseErr) {
+      return {
+        success: false,
+        errors: [`Failed to decode XDR: ${parseErr.message}`],
+        simulatedAt,
+      };
+    }
+
+    // Fetch fee stats (read-only Horizon call) with fallback
+    const BASE_FEE_STROOPS = parseInt(StellarSdk.BASE_FEE, 10); // 100
+    let recommendedFeePerOp = BASE_FEE_STROOPS;
+    let feeWarning;
+
+    try {
+      const feeStats = await this.server.feeStats();
+      const p70 = parseInt(
+        (feeStats.fee_charged && feeStats.fee_charged.p70) ||
+        (feeStats.max_fee && feeStats.max_fee.p70) ||
+        BASE_FEE_STROOPS,
+        10
+      );
+      recommendedFeePerOp = Math.max(p70, BASE_FEE_STROOPS);
+    } catch (_feeErr) {
+      recommendedFeePerOp = BASE_FEE_STROOPS;
+      feeWarning = 'Fee estimate is based on the Stellar network base fee (100 stroops/op); live fee stats were unavailable.';
+    }
+
+    const operationCount = tx.operations.length;
+    const estimatedFeeStroops = recommendedFeePerOp * operationCount;
+
+    // Build estimatedResult from the first operation
+    const firstOp = tx.operations[0];
+    const estimatedResult = {
+      operationType: firstOp ? firstOp.type : 'unknown',
+      sourceAccount: (firstOp && firstOp.source) || tx.source || null,
+      destinationAccount: (firstOp && firstOp.destination) || null,
+    };
+
+    const result = {
+      success: true,
+      estimatedFee: {
+        stroops: estimatedFeeStroops,
+        xlm: (estimatedFeeStroops / 1e7).toFixed(7),
+      },
+      estimatedResult,
+      simulatedAt,
+    };
+
+    if (feeWarning) {
+      result.feeWarning = feeWarning;
+    }
+
+    return result;
+  }
+
+  /**
+   * Set the inflation destination for a Stellar account.
+   *
+   * @param {string} sourceSecret - Secret key of the source account
+   * @param {string} destinationPublicKey - Public key to set as inflation destination
+   * @returns {Promise<{hash: string, ledger: number}>}
+   * @throws {ValidationError} If destinationPublicKey is not a valid Stellar public key
+   * @throws {BusinessLogicError} If the Stellar network rejects the transaction
+   */
+  async setInflationDestination(sourceSecret, destinationPublicKey) {
+    const { ValidationError } = require('../utils/errors');
+
+    if (!StellarSdk.StrKey.isValidEd25519PublicKey(destinationPublicKey)) {
+      throw new ValidationError(
+        `destination must be a valid Stellar public key (56-character Base32 string starting with G); received: ${destinationPublicKey}`
+      );
+    }
+
+    return StellarErrorHandler.wrap(async () => {
+      const sourceKeypair = StellarSdk.Keypair.fromSecret(sourceSecret);
+      const sourceAccount = await this._executeWithRetry(
+        () => this.server.loadAccount(sourceKeypair.publicKey()),
+        'loadAccountForSetInflationDestination'
+      );
+
+      const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+        fee: this.baseFee,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(StellarSdk.Operation.setOptions({ inflationDest: destinationPublicKey }))
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(sourceKeypair);
+
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+
+      log.info('STELLAR_SERVICE', 'Inflation destination set', {
+        source: sourceKeypair.publicKey(),
+        inflationDest: destinationPublicKey,
+        hash: result.hash,
+      });
+
+      return { hash: result.hash, ledger: result.ledger };
+    }, 'setInflationDestination');
+  }
+
+  /**
+   * Append events to the internal event store.
+   * @private
+   * @param {string} contractId
+   * @param {Array} events
+   */
+  _storeEvents(contractId, events) {
+    if (!this._eventStore.has(contractId)) {
+      this._eventStore.set(contractId, []);
+    }
+    this._eventStore.get(contractId).push(...events);
+  }
+
+  /**
+   * Set or update an account data entry on-chain via manageData operation
+   * @param {string} secret - Secret key of the account
+   * @param {string} key - Data entry key (max 64 bytes)
+   * @param {string} value - Data entry value (max 64 bytes), can be base64-encoded string
+   * @returns {Promise<{hash: string, ledger: number}>}
+   */
+  async setAccountData(secret, key, value) {
+    return StellarErrorHandler.wrap(async () => {
+      const keypair = StellarSdk.Keypair.fromSecret(secret);
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(keypair.publicKey()),
+        'loadAccountForManageData'
+      );
+
+      const transaction = new StellarSdk.TransactionBuilder(account, {
+        fee: this.baseFee,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(StellarSdk.Operation.manageData({
+          name: key,
+          value: value,
         }))
         .setTimeout(30)
         .build();
 
-      tx.sign(sourceKeypair);
-      const result = await this._submitTransactionWithNetworkSafety(tx);
-
-      // Extract offer ID from result
-      let newOfferId = offerId;
-      try {
-        const meta = StellarSdk.xdr.TransactionMeta.fromXDR(result.result_meta_xdr, 'base64');
-        const ops = meta.v2().operations();
-        if (ops && ops[0]) {
-          const inner = ops[0].result().tr().manageSellOfferResult().success().offer();
-          if (inner.switch().name === 'manageSellOfferCreated') {
-            newOfferId = inner.offer().offerID().toNumber();
-          }
-        }
-      } catch (_) { /* offerId stays as provided if XDR parsing fails */ }
-
-      return { offerId: newOfferId, transactionId: result.hash, ledger: result.ledger };
-    }, 'createOffer');
+      transaction.sign(keypair);
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+      return {
+        hash: result.hash,
+        ledger: result.ledger,
+      };
+    }, 'setAccountData');
   }
 
   /**
-   * Cancel an existing DEX offer.
+   * Mint a unique NFT donation certificate on Stellar.
+   *
+   * Issues exactly 1 unit of a custom asset to the recipient, then locks the
+   * issuer account (master weight = 0) so no additional supply can ever be
+   * created, enforcing a hard supply cap of 1.
    *
    * @param {Object} params
-   * @param {string} params.sourceSecret - Source account secret key
-   * @param {string} params.sellingAsset - Asset being sold in the offer
-   * @param {string} params.buyingAsset  - Asset being bought in the offer
-   * @param {number} params.offerId      - ID of the offer to cancel
-   * @returns {Promise<{transactionId: string, ledger: number}>}
+   * @param {string} params.issuerSecret        - Secret key of the (fresh) issuer account
+   * @param {string} params.recipientPublicKey  - Stellar public key of the certificate recipient
+   * @param {string} params.donationId          - Donation ID used to derive the asset code
+   * @param {string} [params.amount]            - Donation amount (informational, not used on-chain)
+   * @param {string} [params.campaignId]        - Campaign ID (informational)
+   * @param {string} [params.donatedAt]         - ISO timestamp of the donation (informational)
+   * @returns {Promise<{assetCode: string, issuer: string, txHash: string, ledger: number}>}
+   * @throws {ValidationError}    If inputs are invalid
+   * @throws {BusinessLogicError} If the Stellar operation fails
    */
-  async cancelOffer({ sourceSecret, sellingAsset, buyingAsset, offerId }) {
-    return this.createOffer({ sourceSecret, sellingAsset, buyingAsset, amount: '0', price: '1', offerId });
-  }
-
-  /**
-   * Get the order book for a trading pair from Horizon.
-   *
-   * @param {string} sellingAsset - Base asset ('XLM' or 'CODE:ISSUER')
-   * @param {string} buyingAsset  - Counter asset ('XLM' or 'CODE:ISSUER')
-   * @param {number} [limit=20]   - Max number of bids/asks to return
-   * @returns {Promise<{bids: Array, asks: Array, base: Object, counter: Object}>}
-   */
-  async getOrderBook(sellingAsset, buyingAsset, limit = 20) {
+  async mintCertificateNFT({ issuerSecret, recipientPublicKey, donationId }) {
     return StellarErrorHandler.wrap(async () => {
-      const parseAsset = (assetStr) => {
-        if (assetStr === 'XLM' || assetStr === 'native') return StellarSdk.Asset.native();
-        const [code, issuer] = assetStr.split(':');
-        if (!issuer) throw new Error(`Invalid asset format: ${assetStr}. Use 'XLM' or 'CODE:ISSUER'`);
-        return new StellarSdk.Asset(code, issuer);
-      };
+      const { ValidationError } = require('../utils/errors');
 
-      const result = await this._executeWithRetry(
-        () => this.server.orderbook(parseAsset(sellingAsset), parseAsset(buyingAsset)).limit(limit).call(),
-        'getOrderBook'
+      if (!issuerSecret) throw new ValidationError('issuerSecret is required');
+      if (!recipientPublicKey) throw new ValidationError('recipientPublicKey is required');
+      if (!donationId) throw new ValidationError('donationId is required');
+
+      // Derive asset code: "CERT" + first 8 chars of donationId (uppercase alphanumeric), max 12 chars
+      const suffix = donationId.replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 8);
+      const assetCode = `CERT${suffix}`.slice(0, 12);
+
+      if (!/^[A-Za-z0-9]{1,12}$/.test(assetCode)) {
+        throw new ValidationError(`Derived asset code "${assetCode}" is invalid`);
+      }
+
+      const issuerKeypair = StellarSdk.Keypair.fromSecret(issuerSecret);
+      const issuerPublic = issuerKeypair.publicKey();
+
+      if (issuerPublic === recipientPublicKey) {
+        throw new ValidationError('Issuer and recipient cannot be the same account');
+      }
+
+      const asset = new StellarSdk.Asset(assetCode, issuerPublic);
+
+      const issuerAccount = await this._executeWithRetry(
+        () => this.server.loadAccount(issuerPublic),
+        'loadIssuerForNFT'
       );
+
+      // Build a single transaction that:
+      //   1. Pays exactly 1 unit of the NFT asset to the recipient
+      //   2. Sets issuer master weight to 0 (locks the account — no more issuance possible)
+      const transaction = new StellarSdk.TransactionBuilder(issuerAccount, {
+        fee: this.baseFee,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(StellarSdk.Operation.payment({
+          destination: recipientPublicKey,
+          asset,
+          amount: '1',
+        }))
+        .addOperation(StellarSdk.Operation.setOptions({
+          masterWeight: 0,
+        }))
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(issuerKeypair);
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+
+      log.info('STELLAR_SERVICE', 'NFT certificate minted', {
+        assetCode,
+        issuerPublic,
+        recipientPublicKey,
+        donationId,
+        txHash: result.hash,
+      });
 
       return {
-        bids: result.bids,
-        asks: result.asks,
-        base: result.base,
-        counter: result.counter,
+        assetCode,
+        issuer: issuerPublic,
+        txHash: result.hash,
+        ledger: result.ledger,
       };
-    }, 'getOrderBook');
+    }, 'mintCertificateNFT');
   }
 
   /**
-   * Create a sponsored account on the Stellar network.
+   * Retrieve all donation certificate NFTs held by a wallet.
    *
-   * Uses the Begin/End Sponsoring Future Reserves operation pair so the sponsor
-   * pays the base reserve for the new account.  The new account must co-sign
-   * the transaction.
+   * Queries Horizon for non-native balances on the account and filters for
+   * assets whose code starts with "CERT".
    *
-   * @param {string} sponsorSecret      - Secret key of the sponsoring account
-   * @param {string} newAccountPublic   - Public key of the account to be created
-   * @returns {Promise<{transactionId: string, ledger: number, sponsored: true}>}
+   * @param {string} publicKey - Stellar public key of the wallet to query
+   * @returns {Promise<Array<{assetCode: string, issuer: string, balance: string}>>}
+   * @throws {BusinessLogicError} If the Horizon query fails
    */
-  async createSponsoredAccount(sponsorSecret, newAccountPublic) {
+  async getCertificatesForWallet(publicKey) {
     return StellarErrorHandler.wrap(async () => {
-      const sponsorKeypair = StellarSdk.Keypair.fromSecret(sponsorSecret);
-      const newKeypair = StellarSdk.Keypair.fromPublicKey(newAccountPublic);
-
-      const sponsorAccount = await this._executeWithRetry(
-        () => this.server.loadAccount(sponsorKeypair.publicKey()),
-        'loadSponsorAccount'
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(publicKey),
+        'loadAccountForCertificates'
       );
 
-      const tx = new StellarSdk.TransactionBuilder(sponsorAccount, {
+      return account.balances
+        .filter(b => b.asset_type !== 'native' && b.asset_code && b.asset_code.startsWith('CERT'))
+        .map(b => ({
+          assetCode: b.asset_code,
+          issuer: b.asset_issuer,
+          balance: b.balance,
+        }));
+    }, 'getCertificatesForWallet');
+  }
+
+  /**
+   * Delete an account data entry by setting its value to null
+   * @param {string} secret - Secret key of the account
+   * @param {string} key - Data entry key to delete
+   * @returns {Promise<{hash: string, ledger: number}>}
+   */
+  async deleteAccountData(secret, key) {
+    return StellarErrorHandler.wrap(async () => {
+      const keypair = StellarSdk.Keypair.fromSecret(secret);
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(keypair.publicKey()),
+        'loadAccountForManageDataDelete'
+      );
+
+      const transaction = new StellarSdk.TransactionBuilder(account, {
         fee: this.baseFee,
         networkPassphrase: this.networkPassphrase,
       })
-        .addOperation(StellarSdk.Operation.beginSponsoringFutureReserves({
-          sponsoredId: newAccountPublic,
-        }))
-        .addOperation(StellarSdk.Operation.createAccount({
-          destination: newAccountPublic,
-          startingBalance: '0',
-        }))
-        .addOperation(StellarSdk.Operation.endSponsoringFutureReserves({
-          source: newAccountPublic,
+        .addOperation(StellarSdk.Operation.manageData({
+          name: key,
+          value: null, // Explicitly pass null to delete
         }))
         .setTimeout(30)
         .build();
 
-      tx.sign(sponsorKeypair);
-      tx.sign(newKeypair);
-
-      const result = await this._submitTransactionWithNetworkSafety(tx);
-      return { transactionId: result.hash, ledger: result.ledger, sponsored: true };
-    }, 'createSponsoredAccount');
+      transaction.sign(keypair);
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+      return {
+        hash: result.hash,
+        ledger: result.ledger,
+      };
+    }, 'deleteAccountData');
   }
 
   /**
-   * Revoke sponsorship for an account entry.
-   *
-   * Submits a RevokeSponsorshipOperation targeting the account ledger entry.
-   * After revocation the account must maintain its own base reserve.
-   *
-   * @param {string} sponsorSecret    - Secret key of the current sponsor
-   * @param {string} sponsoredPublic  - Public key of the sponsored account
-   * @returns {Promise<{transactionId: string, ledger: number, revoked: true}>}
+   * Get all signers for a Stellar account
+   * @param {string} publicKey - Stellar public key
+   * @returns {Promise<Array<{publicKey: string, weight: number, type: string}>>}
    */
-  async revokeSponsoredAccount(sponsorSecret, sponsoredPublic) {
+  async getSigners(publicKey) {
     return StellarErrorHandler.wrap(async () => {
-      const sponsorKeypair = StellarSdk.Keypair.fromSecret(sponsorSecret);
-      const sponsorAccount = await this._executeWithRetry(
-        () => this.server.loadAccount(sponsorKeypair.publicKey()),
-        'loadSponsorForRevoke'
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(publicKey),
+        'loadAccountForSigners'
       );
 
-      const tx = new StellarSdk.TransactionBuilder(sponsorAccount, {
+      return account.signers.map(signer => ({
+        publicKey: signer.key,
+        weight: signer.weight,
+        type: signer.type
+      }));
+    }, 'getSigners');
+  }
+
+  /**
+   * Add a signer to a Stellar account
+   * @param {string} masterSecret - Secret key of the master account
+   * @param {string} signerPublic - Public key of the signer to add
+   * @param {number} weight - Weight for the new signer (default: 1)
+   * @returns {Promise<{hash: string, ledger: number}>}
+   */
+  async addSigner(masterSecret, signerPublic, weight = 1) {
+    return StellarErrorHandler.wrap(async () => {
+      const { ValidationError } = require('../utils/errors');
+
+      if (!signerPublic || typeof signerPublic !== 'string') {
+        throw new ValidationError('Signer public key is required');
+      }
+
+      if (typeof weight !== 'number' || weight < 0 || weight > 255) {
+        throw new ValidationError('Weight must be a number between 0 and 255');
+      }
+
+      const masterKeypair = StellarSdk.Keypair.fromSecret(masterSecret);
+      const masterPublic = masterKeypair.publicKey();
+
+      if (masterPublic === signerPublic) {
+        throw new ValidationError('Cannot add master key as a signer');
+      }
+
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(masterPublic),
+        'loadAccountForAddSigner'
+      );
+
+      const transaction = new StellarSdk.TransactionBuilder(account, {
         fee: this.baseFee,
         networkPassphrase: this.networkPassphrase,
       })
-        .addOperation(StellarSdk.Operation.revokeAccountSponsorship({
-          account: sponsoredPublic,
+        .addOperation(StellarSdk.Operation.setOptions({
+          signer: {
+            ed25519PublicKey: signerPublic,
+            weight: weight
+          }
         }))
         .setTimeout(30)
         .build();
 
-      tx.sign(sponsorKeypair);
-      const result = await this._submitTransactionWithNetworkSafety(tx);
-      return { transactionId: result.hash, ledger: result.ledger, revoked: true };
-    }, 'revokeSponsoredAccount');
+      transaction.sign(masterKeypair);
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+
+      log.info('STELLAR_SERVICE', 'Signer added to account', {
+        master: masterPublic,
+        signer: signerPublic,
+        weight,
+        hash: result.hash
+      });
+
+      return {
+        hash: result.hash,
+        ledger: result.ledger,
+        signer: signerPublic,
+        weight
+      };
+    }, 'addSigner');
   }
 
   /**
-   * Claim a claimable balance.
-   *
-   * @param {Object} params
-   * @param {string} params.balanceId - Claimable balance ID
-   * @param {string} params.claimantSecret - Claimant account secret key
-   * @returns {Promise<{transactionId: string, ledger: number}>}
+   * Remove a signer from a Stellar account
+   * @param {string} masterSecret - Secret key of the master account
+   * @param {string} signerPublic - Public key of the signer to remove
+   * @returns {Promise<{hash: string, ledger: number}>}
    */
-  async claimBalance({ balanceId, claimantSecret }) {
+  async removeSigner(masterSecret, signerPublic) {
     return StellarErrorHandler.wrap(async () => {
-      const claimantKeypair = StellarSdk.Keypair.fromSecret(claimantSecret);
-      const claimantAccount = await this._executeWithRetry(
-        () => this.server.loadAccount(claimantKeypair.publicKey()),
-        'loadAccountForClaim'
+      const { ValidationError } = require('../utils/errors');
+
+      if (!signerPublic || typeof signerPublic !== 'string') {
+        throw new ValidationError('Signer public key is required');
+      }
+
+      const masterKeypair = StellarSdk.Keypair.fromSecret(masterSecret);
+      const masterPublic = masterKeypair.publicKey();
+
+      if (masterPublic === signerPublic) {
+        throw new ValidationError('Cannot remove master key as a signer');
+      }
+
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(masterPublic),
+        'loadAccountForRemoveSigner'
       );
 
-      const networkPassphrase = this.networkPassphrase;
+      // Check if signer exists
+      const signerExists = account.signers.some(s => s.key === signerPublic);
+      if (!signerExists) {
+        throw new ValidationError('Signer not found on account');
+      }
 
-      const tx = new StellarSdk.TransactionBuilder(claimantAccount, {
+      // Calculate total weight after removal
+      const currentSigners = account.signers;
+      const threshold = account.thresholds;
+      
+      // Simulate removal and check if account would be locked
+      const remainingSigners = currentSigners.filter(s => s.key !== signerPublic);
+      const totalWeight = remainingSigners.reduce((sum, s) => sum + s.weight, 0);
+      
+      // Check if account would be locked (total weight < low threshold)
+      if (totalWeight < threshold.low) {
+        throw new ValidationError(
+          'Cannot remove signer: account would be locked (total weight would be below low threshold)'
+        );
+      }
+
+      const transaction = new StellarSdk.TransactionBuilder(account, {
         fee: this.baseFee,
-        networkPassphrase,
+        networkPassphrase: this.networkPassphrase,
       })
-        .addOperation(StellarSdk.Operation.claimClaimableBalance({ balanceId }))
+        .addOperation(StellarSdk.Operation.setOptions({
+          signer: {
+            ed25519PublicKey: signerPublic,
+            weight: 0
+          }
+        }))
         .setTimeout(30)
         .build();
 
-      tx.sign(claimantKeypair);
-      const result = await this._submitTransactionWithNetworkSafety(tx);
-      return { transactionId: result.hash, ledger: result.ledger };
-    }, 'claimBalance');
+      transaction.sign(masterKeypair);
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+
+      log.info('STELLAR_SERVICE', 'Signer removed from account', {
+        master: masterPublic,
+        signer: signerPublic,
+        hash: result.hash
+      });
+
+      return {
+        hash: result.hash,
+        ledger: result.ledger,
+        signer: signerPublic
+      };
+    }, 'removeSigner');
+  }
+
+  /**
+   * Update the weight of an existing signer
+   * @param {string} masterSecret - Secret key of the master account
+   * @param {string} signerPublic - Public key of the signer to update
+   * @param {number} newWeight - New weight for the signer
+   * @returns {Promise<{hash: string, ledger: number}>}
+   */
+  async updateSignerWeight(masterSecret, signerPublic, newWeight) {
+    return StellarErrorHandler.wrap(async () => {
+      const { ValidationError } = require('../utils/errors');
+
+      if (!signerPublic || typeof signerPublic !== 'string') {
+        throw new ValidationError('Signer public key is required');
+      }
+
+      if (typeof newWeight !== 'number' || newWeight < 0 || newWeight > 255) {
+        throw new ValidationError('Weight must be a number between 0 and 255');
+      }
+
+      const masterKeypair = StellarSdk.Keypair.fromSecret(masterSecret);
+      const masterPublic = masterKeypair.publicKey();
+
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(masterPublic),
+        'loadAccountForUpdateSigner'
+      );
+
+      // Check if signer exists
+      const signerExists = account.signers.some(s => s.key === signerPublic);
+      if (!signerExists) {
+        throw new ValidationError('Signer not found on account');
+      }
+
+      // Calculate total weight after update
+      const currentSigners = account.signers;
+      const threshold = account.thresholds;
+      
+      // Simulate update and check if account would be locked
+      const updatedSigners = currentSigners.map(s =>
+        s.key === signerPublic ? { ...s, weight: newWeight } : s
+      );
+      const totalWeight = updatedSigners.reduce((sum, s) => sum + s.weight, 0);
+      
+      // Check if account would be locked (total weight < low threshold)
+      if (totalWeight < threshold.low) {
+        throw new ValidationError(
+          'Cannot update signer weight: account would be locked (total weight would be below low threshold)'
+        );
+      }
+
+      const transaction = new StellarSdk.TransactionBuilder(account, {
+        fee: this.baseFee,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(StellarSdk.Operation.setOptions({
+          signer: {
+            ed25519PublicKey: signerPublic,
+            weight: newWeight
+          }
+        }))
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(masterKeypair);
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+
+      log.info('STELLAR_SERVICE', 'Signer weight updated', {
+        master: masterPublic,
+        signer: signerPublic,
+        newWeight,
+        hash: result.hash
+      });
+
+      return {
+        hash: result.hash,
+        ledger: result.ledger,
+        signer: signerPublic,
+        weight: newWeight
+      };
+    }, 'updateSignerWeight');
   }
 }
 

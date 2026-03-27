@@ -27,7 +27,10 @@ const { parseAssetInput } = require('../utils/stellarAsset');
 
 const { getStellarService } = require('../config/stellar');
 const DonationService = require('../services/DonationService');
+const { calculateCostBreakdown } = require('../utils/costBreakdown');
+
 const Transaction = require('./models/transaction');
+const serviceContainer = require('../config/serviceContainer');
 const { LIFECYCLE_STAGES } = require('../middleware/requestLifecycle');
 const federation = require('../utils/federation');
 const stellarService = getStellarService();
@@ -95,8 +98,9 @@ const createDonationSchema = validateSchema({
       },
       recipient: {
         type: 'string',
-        required: true,
+        required: false,
         maxLength: 255,
+        nullable: true,
       },
       memo: {
         type: 'string',
@@ -140,10 +144,72 @@ const createDonationSchema = validateSchema({
         required: false,
         nullable: true,
       },
+      routingStrategy: {
+        type: 'string',
+        required: false,
+        nullable: true,
+        enum: ['highest-need', 'geographic', 'campaign-urgency', 'round-robin'],
+      },
+      poolName: {
+        type: 'string',
+        required: false,
+        nullable: true,
+        maxLength: 255,
+      },
+      donorLatitude: {
+        type: 'number',
+        required: false,
+        nullable: true,
+      },
+      donorLongitude: {
+        type: 'number',
+        required: false,
+        nullable: true,
+      validAfter: {
+        type: 'integerString',
+        required: false,
+        nullable: true,
+        min: 0,
+      },
+      validBefore: {
+        type: 'integerString',
+        required: false,
+        nullable: true,
+        min: 0,
+      },
+      mintCertificate: {
+        type: 'boolean',
+        required: false,
+        nullable: true,
+      },
+      memoHash: {
+        type: 'string',
+        required: false,
+        nullable: true,
+        maxLength: 128,
+      },
     },
     validate: (body) => {
       if ((body.sourceAsset && !body.sourceAmount) || (!body.sourceAsset && body.sourceAmount)) {
         return 'sourceAsset and sourceAmount must be provided together';
+      }
+      // Validate memoHash: must be exactly 32 bytes as hex (64 chars) or base64 (44 chars)
+      if (body.memoHash) {
+        const h = body.memoHash.trim();
+        const isHex = /^[0-9a-fA-F]{64}$/.test(h);
+        const isBase64 = /^[A-Za-z0-9+/]{43}=$/.test(h);
+        if (!isHex && !isBase64) {
+          return 'memoHash must be exactly 32 bytes encoded as hex (64 hex chars) or base64 (44 chars with padding)';
+        }
+      }
+
+      // Validate time bounds: if both provided, validAfter must be < validBefore
+      if (body.validAfter && body.validBefore) {
+        const validAfter = Number(body.validAfter);
+        const validBefore = Number(body.validBefore);
+        if (validAfter >= validBefore) {
+          return 'validAfter must be less than validBefore';
+        }
       }
 
       return null;
@@ -185,6 +251,18 @@ const donationIdParamSchema = validateSchema({
   params: {
     fields: {
       id: { type: 'string', required: true, trim: true, minLength: 1 },
+    },
+  },
+});
+
+/**
+ * Schema for POST /donations/simulate
+ * Requires a non-empty, trimmed XDR string.
+ */
+const simulateSchema = validateSchema({
+  body: {
+    fields: {
+      xdr: { type: 'string', required: true, trim: true, minLength: 1 },
     },
   },
 });
@@ -440,21 +518,115 @@ router.post('/batch', payloadSizeLimiter(ENDPOINT_LIMITS.batchDonation), safeBat
 });
 
 /**
+ * POST /donations/simulate
+ * Dry-run simulate a Stellar transaction without submitting it to the network.
+ *
+ * Request body:
+ *   - xdr {string} (required) — Base64-encoded Stellar transaction envelope XDR
+ *
+ * Response schema (Simulation_Result envelope):
+ *   200 { success: true,  data: Simulation_Result }  — simulation succeeded
+ *   422 { success: false, data: Simulation_Result }  — simulation returned success: false
+ *   400 { ... }                                       — missing/empty xdr (schema middleware)
+ *   401 { ... }                                       — unauthenticated (requireApiKey)
+ *   429 { ... }                                       — rate limit exceeded
+ *   500 { success: false, error: 'Internal server error' } — unexpected error (no stack trace)
+ *
+ * Security: This endpoint is strictly read-only. No transaction is ever submitted to
+ * the Stellar network. The underlying simulateTransaction() method only performs local
+ * XDR decoding and a read-only Horizon fee stats query.
+ */
+router.post('/simulate', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation),
+  donationRateLimiter, requireApiKey, simulateSchema, async (req, res) => {
+    try {
+      const { xdr } = req.body;
+      const result = await stellarService.simulateTransaction(xdr);
+
+      if (!result.success) {
+        return res.status(422).json({ success: false, data: result });
+      }
+
+      return res.status(200).json({ success: true, data: result });
+    } catch (error) {
+      log.error('DONATION_ROUTE', 'Unexpected error during simulation', {
+        requestId: req.id,
+        error: error.message,
+      });
+      return res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+  }
+);
+
+/**
  * POST /donations
  * Create a non-custodial donation record
  */
 router.post('/', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRateLimiter, requireApiKey, requireIdempotency, createDonationSchema, async (req, res, next) => {
   try {
-    const { amount, currency, donor, recipient, memo, memoType, notes, tags, encryptMemo } = req.body;
-    const { amount, currency, donor, recipient, memo, memoType, notes, tags, anonymous } = req.body;
-    const { amount, currency, donor, recipient, memo, memoType, notes, tags, sourceAsset, sourceAmount } = req.body;
+    const { amount, currency, donor, recipient, memo, memoType, notes, tags, encryptMemo, validAfter, validBefore } = req.body;
+    const { amount, currency, donor, recipient, memo, memoType, notes, tags, anonymous, validAfter, validBefore } = req.body;
+    const { amount, currency, donor, recipient, memo, memoType, notes, tags, sourceAsset, sourceAmount, validAfter, validBefore } = req.body;
+    const {
+      amount,
+      currency,
+      donor,
+      recipient,
+      memo,
+      memoType,
+      notes,
+      tags,
+      encryptMemo,
+      anonymous,
+      sourceAsset,
+      sourceAmount,
+      mintCertificate,
+      memoHash,
+      routingStrategy,
+      poolName,
+      donorLatitude,
+      donorLongitude,
+    } = req.body;
+
+    // Determine recipient — either explicit or via routing
+    let resolvedRecipientInput = recipient;
+    let routingResult = null;
+
+    if (!resolvedRecipientInput && !routingStrategy) {
+      throw new ValidationError(
+        'Either recipient or routingStrategy is required',
+        null,
+        ERROR_CODES.ROUTING_STRATEGY_REQUIRED
+      );
+    }
+
+    if (!resolvedRecipientInput && routingStrategy) {
+      if (!poolName) {
+        throw new ValidationError(
+          'poolName is required when routingStrategy is provided',
+          null,
+          ERROR_CODES.POOL_NAME_REQUIRED
+        );
+      }
+
+      const donationRouter = serviceContainer.getDonationRouter();
+      routingResult = await donationRouter.route({
+        poolName,
+        routingStrategy,
+        donorCoordinates: (donorLatitude != null && donorLongitude != null)
+          ? { lat: donorLatitude, lon: donorLongitude }
+          : null,
+        donationId: req.idempotency.key,
+        now: new Date(),
+      });
+      resolvedRecipientInput = routingResult.recipientId;
+    }
 
     // Basic validation
-    if (!amount || !recipient) {
+    if (!amount || !resolvedRecipientInput) {
       throw new ValidationError('Missing required fields: amount, recipient', null, ERROR_CODES.MISSING_REQUIRED_FIELD);
     }
 
-    if (typeof recipient !== 'string' || (donor && typeof donor !== 'string')) {
+    if (typeof resolvedRecipientInput !== 'string' || (donor && typeof donor !== 'string')) {
       return res.status(400).json({
         error: 'Malformed request: donor and recipient must be strings'
       });
@@ -479,6 +651,20 @@ router.post('/', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRat
       }
     }
 
+    // Validate time bounds strictly: validAfter < validBefore
+    const parsedValidAfter = validAfter ? Number(validAfter) : 0;
+    const parsedValidBefore = validBefore ? Number(validBefore) : 0;
+
+    if (parsedValidAfter && parsedValidBefore && parsedValidAfter >= parsedValidBefore) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_TIME_BOUNDS',
+          message: 'validAfter must be strictly less than validBefore'
+        }
+      });
+    }
+
     // Validate memo type + value combination
     if (memo || memoType) {
       const memoValidator = require('../utils/memoValidator');
@@ -491,10 +677,27 @@ router.post('/', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRat
       }
     }
 
+    // If memoHash is provided, override memo/memoType to use hash memo
+    let resolvedMemo = memo;
+    let resolvedMemoType = memoType || 'text';
+    let normalizedMemoHash = null;
+    if (memoHash) {
+      const h = memoHash.trim();
+      // Normalise to hex
+      if (/^[0-9a-fA-F]{64}$/.test(h)) {
+        normalizedMemoHash = h.toLowerCase();
+      } else {
+        // base64 → hex
+        normalizedMemoHash = Buffer.from(h, 'base64').toString('hex');
+      }
+      resolvedMemo = normalizedMemoHash;
+      resolvedMemoType = 'hash';
+    }
+
     // Resolve federation address if needed (e.g. alice*example.com → GABC...)
-    let resolvedRecipient = recipient;
-    if (federation.isFederationAddress(recipient)) {
-      resolvedRecipient = await federation.resolveRecipient(recipient);
+    let resolvedRecipient = resolvedRecipientInput;
+    if (federation.isFederationAddress(resolvedRecipientInput)) {
+      resolvedRecipient = await federation.resolveRecipient(resolvedRecipientInput);
     }
 
     // Optionally encrypt memo using recipient's Stellar public key (ECDH)
@@ -523,14 +726,17 @@ router.post('/', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRat
       currency: currency || 'XLM',
       donor,
       recipient: resolvedRecipient,
-      memo,
+      memo: resolvedMemo,
       sourceAsset: normalizedSourceAsset,
       sourceAmount: sourceAmountValidation ? sourceAmountValidation.value : undefined,
-      memoType: memoType || 'text',
+      memoType: resolvedMemoType,
       notes,
       tags,
       memoEnvelope,
       encryptionMetadata,
+      memoHash: normalizedMemoHash,
+      validAfter: parsedValidAfter,
+      validBefore: parsedValidBefore,
       idempotencyKey: req.idempotency.key,
       apiKeyId: req.apiKey ? req.apiKey.id : null,
       apiKeyRole: req.apiKey ? req.apiKey.role : (req.user?.role || 'user'),
@@ -545,6 +751,58 @@ router.post('/', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRat
       // Fee estimation is best-effort; don't fail the request
     }
 
+    // Optionally mint a donation certificate NFT (non-blocking — failure never blocks donation)
+    let nftResult = null;
+    if (mintCertificate === true) {
+      const issuerSecret = process.env.NFT_ISSUER_SECRET || process.env.STELLAR_SECRET || process.env.SERVICE_SECRET_KEY;
+      const recipientPublicKey = resolvedRecipient;
+
+      if (issuerSecret && recipientPublicKey) {
+        try {
+          const nft = await stellarService.mintCertificateNFT({
+            issuerSecret,
+            recipientPublicKey,
+            donationId: transaction.id,
+            amount: transaction.amount,
+            campaignId: transaction.campaign_id || null,
+            donatedAt: transaction.timestamp,
+          });
+
+          Transaction.updateNftData(transaction.id, {
+            nft_asset_code: nft.assetCode,
+            nft_issuer: nft.issuer,
+            nft_tx_hash: nft.txHash,
+            nft_minted_at: new Date().toISOString(),
+          });
+
+          nftResult = {
+            nftMinted: true,
+            nftAssetCode: nft.assetCode,
+            nftIssuer: nft.issuer,
+            nftTxHash: nft.txHash,
+          };
+        } catch (nftErr) {
+          log.error('DONATION_ROUTE', 'NFT certificate minting failed (non-blocking)', {
+            donationId: transaction.id,
+            error: nftErr.message,
+          });
+
+          try {
+            Transaction.updateNftData(transaction.id, {
+              nft_mint_error: nftErr.message,
+            });
+          } catch (_) { /* best-effort */ }
+
+          nftResult = { nftMinted: false, nftError: nftErr.message };
+        }
+      } else {
+        log.warn('DONATION_ROUTE', 'mintCertificate requested but NFT_ISSUER_SECRET not configured', {
+          donationId: transaction.id,
+        });
+        nftResult = { nftMinted: false, nftError: 'NFT issuer not configured' };
+      }
+    }
+
     // Mark processing complete
     if (req.markLifecycleStage) {
       req.markLifecycleStage(LIFECYCLE_STAGES.PROCESSED);
@@ -556,12 +814,20 @@ router.post('/', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRat
         verified: true,
         transactionHash: transaction.stellarTxId || transaction.id,
         ...(encryptionMetadata && { encryptionMetadata }),
+        ...(nftResult && nftResult),
         ...(feeEstimate && {
           estimatedFee: feeEstimate.feeStroops,
           estimatedFeeXLM: feeEstimate.feeXLM,
           ...(feeEstimate.surgeProtection && {
             feeWarning: 'Network fees are elevated (surge pricing active).'
           }),
+        }),
+        ...(routingResult && {
+          routing: {
+            recipientId: routingResult.recipientId,
+            recipientName: routingResult.recipientName,
+            routingDecisionId: routingResult.routingDecisionId,
+          },
         }),
       }
     };
@@ -655,6 +921,7 @@ const listDonationsQuerySchema = validateSchema({
       donor:      { type: 'string',  required: false, nullable: true, maxLength: 255 },
       recipient:  { type: 'string',  required: false, nullable: true, maxLength: 255 },
       memo:       { type: 'string',  required: false, nullable: true, maxLength: 255 },
+      memoHash:   { type: 'string',  required: false, nullable: true, maxLength: 128 },
       sortBy:     { type: 'string',  required: false, nullable: true, enum: ['timestamp', 'amount', 'status'] },
       order:      { type: 'string',  required: false, nullable: true, enum: ['asc', 'desc'] },
     },
@@ -680,9 +947,21 @@ const listDonationsQuerySchema = validateSchema({
  */
 router.get('/', checkPermission(PERMISSIONS.DONATIONS_READ), listDonationsQuerySchema, (req, res, next) => {
   try {
-    const { tag } = req.query;
+    const { tag, memoHash } = req.query;
     const pagination = parseCursorPaginationQuery(req.query);
     const result = donationService.getPaginatedDonations(pagination, { tag });
+
+    // Filter by memoHash if provided
+    let data = result.data;
+    if (memoHash) {
+      // Normalise query hash to hex for comparison
+      let queryHash = memoHash.trim();
+      if (/^[A-Za-z0-9+/]{43}=$/.test(queryHash)) {
+        queryHash = Buffer.from(queryHash, 'base64').toString('hex');
+      }
+      queryHash = queryHash.toLowerCase();
+      data = data.filter(tx => tx.memoHash && tx.memoHash.toLowerCase() === queryHash);
+    }
     
     // Mark processing complete
     if (req.markLifecycleStage) {
@@ -691,7 +970,7 @@ router.get('/', checkPermission(PERMISSIONS.DONATIONS_READ), listDonationsQueryS
 
     res.setHeader('X-Total-Count', String(result.totalCount));
     
-    const protectedData = result.data.map(tx => applyNotePrivacy(req, tx));
+    const protectedData = data.map(tx => applyNotePrivacy(req, tx));
 
     res.json({
       success: true,
@@ -806,6 +1085,58 @@ router.get('/recent', checkPermission(PERMISSIONS.DONATIONS_READ), recentDonatio
 });
 
 /**
+ * GET /donations/cost-breakdown
+ * Return an itemized cost breakdown for a proposed donation.
+ *
+ * Query parameters:
+ *   @param {string}  amount              - Donation amount in XLM (required, > 0)
+ *   @param {string}  [sender]            - Sender public key (optional, for future balance checks)
+ *   @param {number}  [surgeFeeMultiplier=1]    - Surge fee multiplier (>= 1)
+ *   @param {number}  [xlmUsdRate=0]      - Current XLM/USD rate for USD equivalents
+ *
+ * Platform fee is read from PLATFORM_FEE_PERCENT env variable (default 0).
+ *
+ * @access donations:read
+ */
+router.get('/cost-breakdown', checkPermission(PERMISSIONS.DONATIONS_READ), (req, res, next) => {
+  try {
+    const { amount, surgeFeeMultiplier, xlmUsdRate } = req.query;
+
+    if (!amount) {
+      return res.status(400).json({
+        success: false,
+        error: 'Query parameter "amount" is required',
+      });
+    }
+
+    const amountValidation = validateFloat(amount);
+    if (!amountValidation.valid) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid amount: ${amountValidation.error}`,
+      });
+    }
+
+    // Read platform fee from env (default 0, max 100)
+    const platformFeePercent = Math.min(
+      Math.max(parseFloat(process.env.PLATFORM_FEE_PERCENT || '0') || 0, 0),
+      100
+    );
+
+    const surgeMultiplier = surgeFeeMultiplier
+      ? Math.max(parseFloat(surgeFeeMultiplier) || 1, 1)
+      : 1;
+
+    const usdRate = xlmUsdRate ? parseFloat(xlmUsdRate) || 0 : 0;
+
+    const breakdown = calculateCostBreakdown({
+      amount: amountValidation.value,
+      surgeFeeMultiplier: surgeMultiplier,
+      platformFeePercent,
+      xlmUsdRate: usdRate,
+    });
+
+    return res.json({ success: true, data: breakdown });
  * GET /donations/:id/receipt
  * Generate and return a PDF receipt for a confirmed donation.
  */
@@ -912,6 +1243,46 @@ router.get('/:id/memo/decrypt', requireApiKey, donationIdParamSchema, async (req
         memo: plaintext,
         algorithm: transaction.encryptionMetadata?.algorithm || 'ECDH-X25519-AES256GCM',
       }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /donations/:id/certificate
+ * Return the NFT donation certificate details for a specific donation.
+ * Returns 404 if the donation is not found or has no minted certificate.
+ */
+router.get('/:id/certificate', checkPermission(PERMISSIONS.DONATIONS_READ), donationIdParamSchema, (req, res, next) => {
+  try {
+    const transaction = Transaction.getById(req.params.id);
+
+    if (!transaction) {
+      return res.status(404).json({
+        success: false,
+        error: { code: 'NOT_FOUND', message: `Donation ${req.params.id} not found` },
+      });
+    }
+
+    if (!transaction.nft_asset_code) {
+      return res.status(404).json({
+        success: false,
+        error: { code: 'CERTIFICATE_NOT_FOUND', message: 'No NFT certificate has been minted for this donation' },
+      });
+    }
+
+    if (req.markLifecycleStage) req.markLifecycleStage(LIFECYCLE_STAGES.PROCESSED);
+
+    res.json({
+      success: true,
+      data: {
+        donationId: transaction.id,
+        nftAssetCode: transaction.nft_asset_code,
+        nftIssuer: transaction.nft_issuer,
+        nftTxHash: transaction.nft_tx_hash,
+        nftMintedAt: transaction.nft_minted_at,
+      },
     });
   } catch (error) {
     next(error);
@@ -1125,5 +1496,138 @@ router.post(
     }
   }
 );
+
+/**
+ * GET /donations/:id/impact
+ * Calculate the real-world impact of a specific donation based on its campaign's impact metrics.
+ *
+ * Returns an array of impact breakdowns per metric (e.g. "5 meals delivered").
+ * Returns an empty impact array if the donation has no campaign_id or no metrics are defined.
+ */
+router.get('/:id/impact', checkPermission(PERMISSIONS.DONATIONS_READ), donationIdParamSchema, async (req, res, next) => {
+  try {
+    const ImpactMetricService = require('../services/ImpactMetricService');
+    const transaction = donationService.getDonationById(req.params.id);
+
+    if (!transaction.campaign_id) {
+      return res.json({
+        success: true,
+        data: {
+          donation_id: transaction.id,
+          amount: transaction.amount,
+          campaign_id: null,
+          impact: [],
+          message: 'No campaign associated with this donation',
+        },
+      });
+    }
+
+    const impact = await ImpactMetricService.calculateDonationImpact(
+      parseFloat(transaction.amount),
+      transaction.campaign_id
+    );
+
+    res.json({
+      success: true,
+      data: {
+        donation_id: transaction.id,
+        amount: transaction.amount,
+        campaign_id: transaction.campaign_id,
+        impact,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /donations/:id/verify-memo
+ * Verify that a document's SHA-256 hash matches the hash memo stored on a donation.
+ *
+ * Accepts either:
+ *   - { document: <hex or base64 string of raw bytes> } — hashes the decoded bytes
+ *   - { hash: <hex or base64 encoded 32-byte hash> }    — compares directly
+ *
+ * Returns { verified: boolean, donationId, memoHash, providedHash }
+ */
+router.post('/:id/verify-memo', checkPermission(PERMISSIONS.DONATIONS_READ), donationIdParamSchema, (req, res, next) => {
+  try {
+    const transaction = Transaction.getById(req.params.id);
+
+    if (!transaction) {
+      return res.status(404).json({
+        success: false,
+        error: { code: 'NOT_FOUND', message: `Donation ${req.params.id} not found` },
+      });
+    }
+
+    if (!transaction.memoHash || transaction.memoType !== 'hash') {
+      return res.status(422).json({
+        success: false,
+        error: { code: 'NO_HASH_MEMO', message: 'This donation does not have a hash memo' },
+      });
+    }
+
+    const { document, hash } = req.body;
+
+    if (!document && !hash) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'MISSING_INPUT', message: 'Provide either "document" (raw bytes as hex/base64) or "hash" (32-byte hash as hex/base64)' },
+      });
+    }
+
+    let providedHashHex;
+
+    if (hash) {
+      // Direct hash comparison
+      const h = String(hash).trim();
+      if (/^[0-9a-fA-F]{64}$/.test(h)) {
+        providedHashHex = h.toLowerCase();
+      } else if (/^[A-Za-z0-9+/]{43}=$/.test(h)) {
+        providedHashHex = Buffer.from(h, 'base64').toString('hex');
+      } else {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_HASH', message: 'hash must be exactly 32 bytes as hex (64 chars) or base64 (44 chars)' },
+        });
+      }
+    } else {
+      // Hash the document
+      const crypto = require('crypto');
+      let docBuffer;
+      const d = String(document).trim();
+      if (/^[0-9a-fA-F]+$/.test(d) && d.length % 2 === 0) {
+        docBuffer = Buffer.from(d, 'hex');
+      } else {
+        try {
+          docBuffer = Buffer.from(d, 'base64');
+        } catch {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'INVALID_DOCUMENT', message: 'document must be hex or base64 encoded bytes' },
+          });
+        }
+      }
+      providedHashHex = crypto.createHash('sha256').update(docBuffer).digest('hex');
+    }
+
+    const storedHash = transaction.memoHash.toLowerCase();
+    const verified = storedHash === providedHashHex;
+
+    return res.json({
+      success: true,
+      data: {
+        verified,
+        donationId: transaction.id,
+        memoHash: storedHash,
+        providedHash: providedHashHex,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
 
 module.exports = router;

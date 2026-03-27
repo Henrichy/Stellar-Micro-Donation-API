@@ -49,7 +49,24 @@ class StellarServiceInterface {
     throw new Error('buildAndSubmitFeeBumpTransaction() must be implemented');
   }
 
+  /**
+   * Bump an account's sequence number to a specific value.
+   * Useful for invalidating pre-signed transactions (time-locked escrow, etc.).
+   * @param {string} secret - Secret key of the account to bump
+   * @param {string|number} bumpTo - Target sequence number (must be > current)
+   * @returns {Promise<{hash: string, ledger: number, newSequence: string}>}
+   */
+  async bumpSequence(_secret, _bumpTo) {
+    void _secret;
+    void _bumpTo;
+    throw new Error('bumpSequence() must be implemented');
+  }
+
   isValidAddress(address) {
+    void address;
+    throw new Error('isValidAddress() must be implemented');
+  }
+
   async discoverBestPath(_params) {
     void _params;
     throw new Error('discoverBestPath() must be implemented');
@@ -91,6 +108,54 @@ class StellarServiceInterface {
   async estimateFee(_operationCount = 1) {
     void _operationCount;
     throw new Error('estimateFee() must be implemented');
+  }
+
+  async setInflationDestination(_sourceSecret, _destinationPublicKey) {
+    void _sourceSecret;
+    void _destinationPublicKey;
+    throw new Error('setInflationDestination() must be implemented');
+  }
+
+  async getInflationDestination(_publicKey) {
+    void _publicKey;
+    throw new Error('getInflationDestination() must be implemented');
+  }
+
+  async setHomeDomain(_sourceSecret, _domain) {
+    void _sourceSecret;
+    void _domain;
+    throw new Error('setHomeDomain() must be implemented');
+  }
+
+  async getHomeDomain(_publicKey) {
+    void _publicKey;
+    throw new Error('getHomeDomain() must be implemented');
+  }
+
+  async setAccountData(_secret, _key, _value) {
+    void _secret;
+    void _key;
+    void _value;
+    throw new Error('setAccountData() must be implemented');
+  }
+
+  async deleteAccountData(_secret, _key) {
+    void _secret;
+    void _key;
+    throw new Error('deleteAccountData() must be implemented');
+  }
+
+  async mintCertificateNFT(_params) {
+    void _params;
+    throw new Error('mintCertificateNFT() must be implemented');
+  }
+
+  async getCertificatesForWallet(_publicKey) {
+    void _publicKey;
+    throw new Error('getCertificatesForWallet() must be implemented');
+  async simulateTransaction(_xdr) {
+    void _xdr;
+    throw new Error('simulateTransaction() must be implemented');
   }
 }
 

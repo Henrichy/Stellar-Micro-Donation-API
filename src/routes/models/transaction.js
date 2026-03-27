@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { v4: uuidv4 } = require('uuid');
 const donationEvents = require('../../events/donationEvents');
 const {
   TRANSACTION_STATES,
@@ -66,12 +67,13 @@ class Transaction {
     const nowIso = new Date().toISOString();
     const newTransaction = {
       ...transactionData,
-      id: transactionData.id || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      id: transactionData.id || uuidv4(),
       amount: transactionData.amount,
       donor: transactionData.donor,
       recipient: transactionData.recipient,
       memo: transactionData.memo || '',
       memoType: transactionData.memoType || 'text',
+      memoHash: transactionData.memoHash || null,
       encryptionMetadata: transactionData.encryptionMetadata || null,
       memoEnvelope: transactionData.memoEnvelope || null,
       notes: transactionData.notes || null,
@@ -246,6 +248,33 @@ class Transaction {
   // Test helper for integration suites.
   static _clearAllData() {
     this.saveTransactions([]);
+  }
+
+  /**
+   * Update NFT certificate fields on a transaction record.
+   * @param {string} id - Transaction ID
+   * @param {Object} nftData
+   * @param {string} [nftData.nft_asset_code]
+   * @param {string} [nftData.nft_issuer]
+   * @param {string} [nftData.nft_tx_hash]
+   * @param {string} [nftData.nft_minted_at]
+   * @param {string} [nftData.nft_mint_error]
+   * @returns {Object} Updated transaction
+   */
+  static updateNftData(id, nftData) {
+    const transactions = this.loadTransactions();
+    const index = transactions.findIndex(t => t.id === id);
+    if (index === -1) throw new Error(`Transaction not found: ${id}`);
+
+    const fields = ['nft_asset_code', 'nft_issuer', 'nft_tx_hash', 'nft_minted_at', 'nft_mint_error'];
+    for (const field of fields) {
+      if (Object.prototype.hasOwnProperty.call(nftData, field)) {
+        transactions[index][field] = nftData[field];
+      }
+    }
+
+    this.saveTransactions(transactions);
+    return transactions[index];
   }
 }
 

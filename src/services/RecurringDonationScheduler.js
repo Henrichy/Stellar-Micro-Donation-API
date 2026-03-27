@@ -17,8 +17,8 @@
 
 const Database = require('../utils/database');
 const WebhookService = require('./WebhookService');
+const ApiKeyExpirationNotifier = require('./ApiKeyExpirationNotifier');
 const { SCHEDULE_STATUS, DONATION_FREQUENCIES } = require('../constants');
-const Database = require('../utils/database');
 const log = require('../utils/log');
 const { revokeExpiredDeprecatedKeys } = require('../models/apiKeys');
 const {
@@ -38,6 +38,10 @@ class RecurringDonationScheduler {
 
     /** How often the scheduler polls for due donations (ms) */
     this.checkInterval = 60_000; // 1 minute
+
+    // Backup configuration (default: daily)
+    this.backupInterval = parseInt(process.env.BACKUP_INTERVAL_MS, 10) || 24 * 60 * 60 * 1000;
+    this.lastBackupAt = 0;
 
     // Retry configuration
     this.maxRetries = 3;
@@ -195,6 +199,13 @@ class RecurringDonationScheduler {
         log.error('RECURRING_SCHEDULER', 'Failed to auto-revoke expired API keys', { error: revokeError.message });
       }
 
+      // Send expiry notifications for keys approaching or past their expiration date
+      try {
+        await ApiKeyExpirationNotifier.run();
+      } catch (notifyError) {
+        log.error('RECURRING_SCHEDULER', 'API key expiry notification job failed', { error: notifyError.message });
+      }
+
       // Run data retention job once per cleanupInterval
       const now2 = Date.now();
       if (now2 - this.lastCleanupAt >= this.cleanupInterval) {
@@ -204,6 +215,19 @@ class RecurringDonationScheduler {
           await retentionService.runAll();
         } catch (retentionError) {
           log.error('RECURRING_SCHEDULER', 'Retention job failed', { error: retentionError.message });
+        }
+      }
+
+      // Run scheduled database backup once per backupInterval
+      if (now2 - this.lastBackupAt >= this.backupInterval) {
+        this.lastBackupAt = now2;
+        try {
+          const BackupService = require('./BackupService');
+          const backupService = new BackupService();
+          const result = await backupService.backup();
+          log.info('RECURRING_SCHEDULER', 'Scheduled backup completed', { backupId: result.backupId });
+        } catch (backupError) {
+          log.error('RECURRING_SCHEDULER', 'Scheduled backup failed', { error: backupError.message });
         }
       }
     } catch (error) {
