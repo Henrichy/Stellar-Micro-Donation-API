@@ -1435,6 +1435,74 @@ class MockStellarService extends StellarServiceInterface {
   }
 
   /**
+   * Simulate (dry-run) a Stellar transaction without hitting any real Horizon endpoint.
+   *
+   * Behavior:
+   * - Returns `success: false` with a descriptive error if `xdr` is falsy, empty, or null.
+   * - Returns `success: false` with the configured failure message when failure simulation
+   *   is enabled (`this.failureSimulation.enabled` is true).
+   * - Otherwise returns `success: true` with a realistic `estimatedFee` based on the
+   *   configured mock fee multiplier, a stub `estimatedResult`, and a `simulatedAt` timestamp.
+   *
+   * Configurable failure modes:
+   * - Call `enableFailureSimulation(type)` before invoking this method to trigger a
+   *   `success: false` result. The `errors` array will reflect the configured failure type.
+   *
+   * IMPORTANT: This method never calls any real Horizon network endpoint.
+   *
+   * @param {string} xdr - Base64-encoded Stellar transaction envelope XDR (not validated in mock)
+   * @returns {Promise<{
+   *   success: boolean,
+   *   estimatedFee?: { stroops: number, xlm: string },
+   *   estimatedResult?: { operationType: string, sourceAccount: string|null, destinationAccount: string|null },
+   *   errors?: string[],
+   *   simulatedAt: string
+   * }>} Simulation_Result
+   */
+  async simulateTransaction(xdr) {
+    const simulatedAt = new Date().toISOString();
+
+    // Guard: xdr must be a non-empty string
+    if (!xdr || typeof xdr !== 'string' || xdr.trim() === '') {
+      return {
+        success: false,
+        errors: ['xdr is required and must be a non-empty string'],
+        simulatedAt,
+      };
+    }
+
+    // Failure simulation
+    if (this.failureSimulation.enabled) {
+      const failureType = this.failureSimulation.type || 'unknown';
+      return {
+        success: false,
+        errors: [`Simulation failed: ${failureType}`],
+        simulatedAt,
+      };
+    }
+
+    // Return a realistic success result
+    const BASE_FEE_STROOPS = 100;
+    const multiplier = this.config.feeMultiplier !== undefined ? this.config.feeMultiplier : 1;
+    const feePerOp = Math.round(BASE_FEE_STROOPS * multiplier);
+    const estimatedFeeStroops = feePerOp; // mock assumes 1 operation
+
+    return {
+      success: true,
+      estimatedFee: {
+        stroops: estimatedFeeStroops,
+        xlm: (estimatedFeeStroops / 1e7).toFixed(7),
+      },
+      estimatedResult: {
+        operationType: 'payment',
+        sourceAccount: null,
+        destinationAccount: null,
+      },
+      simulatedAt,
+    };
+  }
+
+  /**
    * Estimate the transaction fee for a given number of operations.
    * Simulates fee variations including surge pricing.
    * @param {number} [operationCount=1]
@@ -1498,6 +1566,57 @@ class MockStellarService extends StellarServiceInterface {
       fee: newFeeStroops,
       envelopeXdr: 'mock_feebump_envelope_' + crypto.randomBytes(8).toString('hex'),
     };
+  }
+
+  /**
+   * Simulate bumping an account's sequence number.
+   * Updates the in-memory wallet sequence and returns a mock transaction result.
+   *
+   * @param {string} secret - Secret key of the account to bump
+   * @param {string|number} bumpTo - Target sequence number (must be > current)
+   * @returns {Promise<{hash: string, ledger: number, newSequence: string}>}
+   */
+  async bumpSequence(secret, bumpTo) {
+    await this._simulateNetworkDelay();
+    this._checkRateLimit();
+    this._simulateFailure();
+
+    if (!secret) {
+      throw new ValidationError('secret is required');
+    }
+    this._validateSecretKey(secret);
+
+    const bumpToNum = BigInt(bumpTo);
+    if (bumpToNum < BigInt(0)) {
+      throw new ValidationError('bumpTo must be a non-negative integer');
+    }
+
+    const wallet = this._findWalletBySecret(secret);
+    if (!wallet) {
+      throw new NotFoundError('Account not found for provided secret key', ERROR_CODES.WALLET_NOT_FOUND);
+    }
+
+    const currentSeq = BigInt(wallet.sequence || 0);
+    if (bumpToNum <= currentSeq) {
+      throw new BusinessLogicError(
+        ERROR_CODES.INVALID_REQUEST || 'INVALID_REQUEST',
+        `bumpTo (${bumpTo}) must be greater than current sequence (${currentSeq})`
+      );
+    }
+
+    wallet.sequence = String(bumpToNum);
+
+    const hash = 'mock_bumpseq_' + crypto.randomBytes(16).toString('hex');
+    const ledger = Math.floor(Math.random() * 1000000) + 1000000;
+
+    log.info('MOCK_STELLAR_SERVICE', 'Bump sequence submitted', {
+      publicKey: wallet.publicKey,
+      previousSequence: String(currentSeq),
+      newSequence: String(bumpToNum),
+      hash,
+    });
+
+    return { hash, ledger, newSequence: String(bumpToNum) };
   }
 
   /**
