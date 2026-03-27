@@ -1112,6 +1112,9 @@ class StellarService extends StellarServiceInterface {
 
       return { hash: result.hash, ledger: result.ledger };
     }, 'setHomeDomain');
+  }
+
+  /**
    * Query Horizon for an account and normalise the outcome into a discriminated union.
    *
    * This method never throws — all outcomes are returned as plain values so callers
@@ -1305,6 +1308,7 @@ class StellarService extends StellarServiceInterface {
     }, 'setInflationDestination');
   }
 
+  /**
    * Append events to the internal event store.
    * @private
    * @param {string} contractId
@@ -1497,6 +1501,248 @@ class StellarService extends StellarServiceInterface {
         ledger: result.ledger,
       };
     }, 'deleteAccountData');
+  }
+
+  /**
+   * Get all signers for a Stellar account
+   * @param {string} publicKey - Stellar public key
+   * @returns {Promise<Array<{publicKey: string, weight: number, type: string}>>}
+   */
+  async getSigners(publicKey) {
+    return StellarErrorHandler.wrap(async () => {
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(publicKey),
+        'loadAccountForSigners'
+      );
+
+      return account.signers.map(signer => ({
+        publicKey: signer.key,
+        weight: signer.weight,
+        type: signer.type
+      }));
+    }, 'getSigners');
+  }
+
+  /**
+   * Add a signer to a Stellar account
+   * @param {string} masterSecret - Secret key of the master account
+   * @param {string} signerPublic - Public key of the signer to add
+   * @param {number} weight - Weight for the new signer (default: 1)
+   * @returns {Promise<{hash: string, ledger: number}>}
+   */
+  async addSigner(masterSecret, signerPublic, weight = 1) {
+    return StellarErrorHandler.wrap(async () => {
+      const { ValidationError } = require('../utils/errors');
+
+      if (!signerPublic || typeof signerPublic !== 'string') {
+        throw new ValidationError('Signer public key is required');
+      }
+
+      if (typeof weight !== 'number' || weight < 0 || weight > 255) {
+        throw new ValidationError('Weight must be a number between 0 and 255');
+      }
+
+      const masterKeypair = StellarSdk.Keypair.fromSecret(masterSecret);
+      const masterPublic = masterKeypair.publicKey();
+
+      if (masterPublic === signerPublic) {
+        throw new ValidationError('Cannot add master key as a signer');
+      }
+
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(masterPublic),
+        'loadAccountForAddSigner'
+      );
+
+      const transaction = new StellarSdk.TransactionBuilder(account, {
+        fee: this.baseFee,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(StellarSdk.Operation.setOptions({
+          signer: {
+            ed25519PublicKey: signerPublic,
+            weight: weight
+          }
+        }))
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(masterKeypair);
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+
+      log.info('STELLAR_SERVICE', 'Signer added to account', {
+        master: masterPublic,
+        signer: signerPublic,
+        weight,
+        hash: result.hash
+      });
+
+      return {
+        hash: result.hash,
+        ledger: result.ledger,
+        signer: signerPublic,
+        weight
+      };
+    }, 'addSigner');
+  }
+
+  /**
+   * Remove a signer from a Stellar account
+   * @param {string} masterSecret - Secret key of the master account
+   * @param {string} signerPublic - Public key of the signer to remove
+   * @returns {Promise<{hash: string, ledger: number}>}
+   */
+  async removeSigner(masterSecret, signerPublic) {
+    return StellarErrorHandler.wrap(async () => {
+      const { ValidationError } = require('../utils/errors');
+
+      if (!signerPublic || typeof signerPublic !== 'string') {
+        throw new ValidationError('Signer public key is required');
+      }
+
+      const masterKeypair = StellarSdk.Keypair.fromSecret(masterSecret);
+      const masterPublic = masterKeypair.publicKey();
+
+      if (masterPublic === signerPublic) {
+        throw new ValidationError('Cannot remove master key as a signer');
+      }
+
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(masterPublic),
+        'loadAccountForRemoveSigner'
+      );
+
+      // Check if signer exists
+      const signerExists = account.signers.some(s => s.key === signerPublic);
+      if (!signerExists) {
+        throw new ValidationError('Signer not found on account');
+      }
+
+      // Calculate total weight after removal
+      const currentSigners = account.signers;
+      const threshold = account.thresholds;
+      
+      // Simulate removal and check if account would be locked
+      const remainingSigners = currentSigners.filter(s => s.key !== signerPublic);
+      const totalWeight = remainingSigners.reduce((sum, s) => sum + s.weight, 0);
+      
+      // Check if account would be locked (total weight < low threshold)
+      if (totalWeight < threshold.low) {
+        throw new ValidationError(
+          'Cannot remove signer: account would be locked (total weight would be below low threshold)'
+        );
+      }
+
+      const transaction = new StellarSdk.TransactionBuilder(account, {
+        fee: this.baseFee,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(StellarSdk.Operation.setOptions({
+          signer: {
+            ed25519PublicKey: signerPublic,
+            weight: 0
+          }
+        }))
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(masterKeypair);
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+
+      log.info('STELLAR_SERVICE', 'Signer removed from account', {
+        master: masterPublic,
+        signer: signerPublic,
+        hash: result.hash
+      });
+
+      return {
+        hash: result.hash,
+        ledger: result.ledger,
+        signer: signerPublic
+      };
+    }, 'removeSigner');
+  }
+
+  /**
+   * Update the weight of an existing signer
+   * @param {string} masterSecret - Secret key of the master account
+   * @param {string} signerPublic - Public key of the signer to update
+   * @param {number} newWeight - New weight for the signer
+   * @returns {Promise<{hash: string, ledger: number}>}
+   */
+  async updateSignerWeight(masterSecret, signerPublic, newWeight) {
+    return StellarErrorHandler.wrap(async () => {
+      const { ValidationError } = require('../utils/errors');
+
+      if (!signerPublic || typeof signerPublic !== 'string') {
+        throw new ValidationError('Signer public key is required');
+      }
+
+      if (typeof newWeight !== 'number' || newWeight < 0 || newWeight > 255) {
+        throw new ValidationError('Weight must be a number between 0 and 255');
+      }
+
+      const masterKeypair = StellarSdk.Keypair.fromSecret(masterSecret);
+      const masterPublic = masterKeypair.publicKey();
+
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(masterPublic),
+        'loadAccountForUpdateSigner'
+      );
+
+      // Check if signer exists
+      const signerExists = account.signers.some(s => s.key === signerPublic);
+      if (!signerExists) {
+        throw new ValidationError('Signer not found on account');
+      }
+
+      // Calculate total weight after update
+      const currentSigners = account.signers;
+      const threshold = account.thresholds;
+      
+      // Simulate update and check if account would be locked
+      const updatedSigners = currentSigners.map(s =>
+        s.key === signerPublic ? { ...s, weight: newWeight } : s
+      );
+      const totalWeight = updatedSigners.reduce((sum, s) => sum + s.weight, 0);
+      
+      // Check if account would be locked (total weight < low threshold)
+      if (totalWeight < threshold.low) {
+        throw new ValidationError(
+          'Cannot update signer weight: account would be locked (total weight would be below low threshold)'
+        );
+      }
+
+      const transaction = new StellarSdk.TransactionBuilder(account, {
+        fee: this.baseFee,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(StellarSdk.Operation.setOptions({
+          signer: {
+            ed25519PublicKey: signerPublic,
+            weight: newWeight
+          }
+        }))
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(masterKeypair);
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+
+      log.info('STELLAR_SERVICE', 'Signer weight updated', {
+        master: masterPublic,
+        signer: signerPublic,
+        newWeight,
+        hash: result.hash
+      });
+
+      return {
+        hash: result.hash,
+        ledger: result.ledger,
+        signer: signerPublic,
+        weight: newWeight
+      };
+    }, 'updateSignerWeight');
   }
 }
 

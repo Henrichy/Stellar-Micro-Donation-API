@@ -339,6 +339,20 @@ const buildConfig = (env, isProduction, isTest) => {
     maxmindDbPath: process.env.MAXMIND_DB_PATH || path.join(__dirname, '../../data/GeoLite2-Country.mmdb'),
   };
 
+  // Organization tax configuration for IRS compliance
+  const taxReceipt = {
+    ein: process.env.ORGANIZATION_EIN || null,
+    legalName: process.env.ORGANIZATION_LEGAL_NAME || null,
+    address: process.env.ORGANIZATION_ADDRESS || null,
+    city: process.env.ORGANIZATION_CITY || null,
+    state: process.env.ORGANIZATION_STATE || null,
+    zipCode: process.env.ORGANIZATION_ZIP_CODE || null,
+    phone: process.env.ORGANIZATION_PHONE || null,
+    email: process.env.ORGANIZATION_EMAIL || null,
+    website: process.env.ORGANIZATION_WEBSITE || null,
+    isConfigured: !!(process.env.ORGANIZATION_EIN && process.env.ORGANIZATION_LEGAL_NAME),
+  };
+
   // Application metadata
   const app = {
     name: 'stellar-micro-donation-api',
@@ -355,6 +369,7 @@ const buildConfig = (env, isProduction, isTest) => {
     logging,
     encryption,
     geoBlocking,
+    taxReceipt,
     app,
   };
   
