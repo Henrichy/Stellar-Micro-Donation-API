@@ -1,230 +1,169 @@
 /**
  * Bulk Wallet Import Service
  *
- * RESPONSIBILITY: Orchestrate batch import of existing Stellar wallets
+ * RESPONSIBILITY: Parse CSV/JSON files and atomically import wallet records.
  * OWNER: Backend Team
- * DEPENDENCIES: WalletService, StellarService, stellar-sdk
- *
- * Validates each wallet independently, detects intra-batch and data-store
- * duplicates, queries Horizon concurrently, persists passing wallets, and
- * returns a per-wallet results array with a summary object.
+ * DEPENDENCIES: Wallet model, csv-parse, stellar-sdk
  */
 
+const { parse } = require('csv-parse/sync');
 const StellarSdk = require('stellar-sdk');
+const Wallet = require('../routes/models/wallet');
+
+const DEFAULT_MAX_ROWS = 1000;
+
+/**
+ * Parse a Buffer/string as JSON, returning an array of wallet objects.
+ * @param {Buffer} buffer
+ * @returns {Object[]}
+ */
+function parseJSON(buffer) {
+  const parsed = JSON.parse(buffer.toString('utf8'));
+  if (!Array.isArray(parsed)) throw new Error('JSON body must be an array');
+  return parsed;
+}
+
+/**
+ * Parse a Buffer/string as CSV, returning an array of wallet objects.
+ * Expects a header row with at least a `public_key` column.
+ * @param {Buffer} buffer
+ * @returns {Object[]}
+ */
+function parseCSV(buffer) {
+  return parse(buffer, { columns: true, skip_empty_lines: true, trim: true });
+}
+
+/**
+ * Validate a single wallet row.
+ * @param {Object} row
+ * @returns {{ valid: true } | { valid: false, reason: string }}
+ */
+function validateRow(row) {
+  if (row.secret_key !== undefined || row.private_key !== undefined) {
+    return { valid: false, reason: 'private_key_not_accepted' };
+  }
+  if (!row.public_key || typeof row.public_key !== 'string') {
+    return { valid: false, reason: 'missing_public_key' };
+  }
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(row.public_key)) {
+    return { valid: false, reason: 'invalid_address' };
+  }
+  return { valid: true };
+}
 
 class BulkWalletImportService {
   /**
-   * Create a new BulkWalletImportService instance.
-   * @param {import('./WalletService')} walletService - WalletService instance for data-store operations
-   * @param {import('./StellarService')} stellarService - StellarService instance for Horizon queries
+   * Parse file buffer into an array of wallet objects.
+   *
+   * @param {Buffer} buffer - Raw file content.
+   * @param {'application/json'|'text/csv'} mimeType - Content type of the file.
+   * @returns {Object[]} Parsed rows.
+   * @throws {Error} If the format is unsupported or parsing fails.
    */
-  constructor(walletService, stellarService) {
-    this.walletService = walletService;
-    this.stellarService = stellarService;
+  parseFile(buffer, mimeType) {
+    if (mimeType === 'application/json' || mimeType === 'json') {
+      return parseJSON(buffer);
+    }
+    if (mimeType === 'text/csv' || mimeType === 'csv') {
+      return parseCSV(buffer);
+    }
+    throw new Error(`Unsupported file type: ${mimeType}`);
   }
 
   /**
-   * Validate a single wallet object from the import batch.
+   * Import wallets from a parsed array with full pre-validation and atomic rollback.
    *
-   * Validation rules are checked in this order:
-   * 1. Private key fields present (`secret_key` or `private_key`) → `private_key_not_accepted`
-   * 2. Missing or non-string `public_key` → `missing_public_key`
-   * 3. Invalid Stellar StrKey format → `invalid_address`
+   * Steps:
+   * 1. Enforce row limit (BULK_IMPORT_MAX_ROWS env var, default 1000).
+   * 2. Validate each row (public key format, no private keys).
+   * 3. Detect intra-file duplicate public keys.
+   * 4. If any row fails steps 2-3, abort immediately — zero records written.
+   * 5. Wrap all Wallet.create() calls in a snapshot-based transaction:
+   *    if any insert fails, roll back all previously inserted records.
    *
-   * @private
-   * @param {Object} wallet - Wallet object from the request body
-   * @param {number} index  - Zero-based position in the input array (reserved for future use)
-   * @returns {{ valid: true } | { valid: false, reason: string }}
+   * @param {Object[]} rows - Array of wallet objects (already parsed).
+   * @returns {{
+   *   totalSubmitted: number,
+   *   totalCreated: number,
+   *   details: Array<{ row: number, public_key: string, status: string, reason?: string }>
+   * }}
    */
-  _validateWallet(wallet, index) { // eslint-disable-line no-unused-vars
-    // Rule 1: reject private key fields
-    if (wallet.secret_key !== undefined || wallet.private_key !== undefined) {
-      return { valid: false, reason: 'private_key_not_accepted' };
+  importRows(rows) {
+    const maxRows = parseInt(process.env.BULK_IMPORT_MAX_ROWS || DEFAULT_MAX_ROWS, 10);
+
+    if (rows.length > maxRows) {
+      const err = new Error(`File exceeds maximum row limit of ${maxRows}`);
+      err.code = 'ROW_LIMIT_EXCEEDED';
+      err.limit = maxRows;
+      throw err;
     }
 
-    // Rule 2: public_key must be present and a string
-    if (wallet.public_key === undefined || wallet.public_key === null || typeof wallet.public_key !== 'string') {
-      return { valid: false, reason: 'missing_public_key' };
-    }
+    // Pre-validation: validate all rows and detect duplicates before any DB write
+    const seen = new Set();
+    const validationErrors = [];
 
-    // Rule 3: public_key must be a valid Stellar Ed25519 public key
-    if (!StellarSdk.StrKey.isValidEd25519PublicKey(wallet.public_key)) {
-      return { valid: false, reason: 'invalid_address' };
-    }
-
-    return { valid: true };
-  }
-
-  /**
-   * Import a batch of wallets.
-   *
-   * Processing steps:
-   * 1. Validate each wallet with `_validateWallet`.
-   * 2. Build an intra-batch seen-set; mark subsequent occurrences of the same
-   *    `public_key` as `duplicate`.
-   * 3. For all valid, non-intra-batch-duplicate keys, call
-   *    `WalletService.getWalletByAddress` to detect data-store duplicates.
-   * 4. For all remaining valid, non-duplicate keys, call
-   *    `StellarService.getAccountInfo` concurrently via `Promise.allSettled`.
-   * 5. Map Horizon outcomes: balance → success; notFound → unfunded_account;
-   *    error → horizon_unavailable.
-   * 6. For each wallet that passed all checks, call
-   *    `WalletService.createWalletRecord(key, balance)`.
-   * 7. Assemble the `results` array in original input order.
-   * 8. Compute and return the `summary` object.
-   *
-   * @param {Array<Object>} wallets  - Array of wallet objects from the request body
-   * @param {string}        clientId - Authenticated client identifier (for audit use by caller)
-   * @returns {Promise<{ results: Array<ImportResult>, summary: Summary }>}
-   *
-   * @typedef {Object} ImportResult
-   * @property {string}      public_key - The submitted public key (or empty string if missing)
-   * @property {'success'|'duplicate'|'failed'} status
-   * @property {string|null} reason     - Non-null when status is 'failed' or 'duplicate'
-   * @property {string|null} id         - Wallet record id when status is 'success', else null
-   *
-   * @typedef {Object} Summary
-   * @property {number} total
-   * @property {number} succeeded
-   * @property {number} duplicates
-   * @property {number} failed
-   */
-  async importBatch(wallets, clientId) { // eslint-disable-line no-unused-vars
-    const count = wallets.length;
-
-    // Per-wallet state tracked by original index
-    // Each slot: { publicKey, status, reason, id }
-    const slots = new Array(count).fill(null).map(() => ({
-      publicKey: null,
-      status: null,
-      reason: null,
-      id: null,
-    }));
-
-    // ── Step 1: Validate each wallet ────────────────────────────────────────
-    for (let i = 0; i < count; i++) {
-      const wallet = wallets[i];
-      const publicKey = typeof wallet.public_key === 'string' ? wallet.public_key : '';
-      slots[i].publicKey = publicKey;
-
-      const validation = this._validateWallet(wallet, i);
-      if (!validation.valid) {
-        slots[i].status = 'failed';
-        slots[i].reason = validation.reason;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const result = validateRow(row);
+      if (!result.valid) {
+        validationErrors.push({ row: i + 1, public_key: row.public_key || '', reason: result.reason });
+        continue;
       }
-    }
-
-    // ── Step 2: Intra-batch duplicate detection ──────────────────────────────
-    // Only consider wallets that passed validation so far
-    const seenKeys = new Set();
-    for (let i = 0; i < count; i++) {
-      if (slots[i].status !== null) continue; // already failed
-
-      const key = slots[i].publicKey;
-      if (seenKeys.has(key)) {
-        slots[i].status = 'duplicate';
-        slots[i].reason = 'duplicate';
-      } else {
-        seenKeys.add(key);
+      if (seen.has(row.public_key)) {
+        validationErrors.push({ row: i + 1, public_key: row.public_key, reason: 'duplicate_in_file' });
+        continue;
       }
+      seen.add(row.public_key);
     }
 
-    // ── Step 3: Data-store duplicate check ──────────────────────────────────
-    // Collect indices of wallets still pending (passed validation, not intra-batch dup)
-    const pendingIndices = [];
-    for (let i = 0; i < count; i++) {
-      if (slots[i].status === null) {
-        pendingIndices.push(i);
+    if (validationErrors.length > 0) {
+      const err = new Error('Validation failed: one or more rows are invalid');
+      err.code = 'VALIDATION_FAILED';
+      err.details = validationErrors;
+      throw err;
+    }
+
+    // Transactional insert: snapshot wallets.json, insert all, roll back on any failure
+    const snapshot = Wallet.loadWallets();
+    const details = [];
+    const created = [];
+
+    try {
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const wallet = Wallet.create({
+          address: row.public_key,
+          label: row.label || null,
+          ownerName: row.owner_name || null,
+        });
+        created.push(wallet);
+        details.push({ row: i + 1, public_key: row.public_key, status: 'created', id: wallet.id });
       }
+    } catch (insertErr) {
+      // Rollback: restore snapshot
+      Wallet.saveWallets(snapshot);
+      const err = new Error(`Insert failed, transaction rolled back: ${insertErr.message}`);
+      err.code = 'INSERT_FAILED';
+      throw err;
     }
 
-    for (const i of pendingIndices) {
-      const existing = this.walletService.getWalletByAddress(slots[i].publicKey);
-      if (existing) {
-        slots[i].status = 'duplicate';
-        slots[i].reason = 'duplicate';
-      }
-    }
-
-    // ── Step 4 & 5: Concurrent Horizon queries ───────────────────────────────
-    // Re-collect indices still pending after data-store check
-    const horizonIndices = pendingIndices.filter(i => slots[i].status === null);
-
-    if (horizonIndices.length > 0) {
-      const horizonPromises = horizonIndices.map(i =>
-        this.stellarService.getAccountInfo(slots[i].publicKey)
-      );
-
-      const settled = await Promise.allSettled(horizonPromises);
-
-      for (let j = 0; j < horizonIndices.length; j++) {
-        const i = horizonIndices[j];
-        const outcome = settled[j];
-
-        if (outcome.status === 'rejected') {
-          // Promise itself rejected (unexpected — getAccountInfo should not throw)
-          slots[i].status = 'failed';
-          slots[i].reason = 'horizon_unavailable';
-          continue;
-        }
-
-        const result = outcome.value;
-
-        if (result.error) {
-          slots[i].status = 'failed';
-          slots[i].reason = 'horizon_unavailable';
-        } else if (result.notFound) {
-          // Unfunded account — still a success, balance is null
-          slots[i].status = 'success';
-          slots[i].reason = 'unfunded_account';
-          slots[i]._balance = null;
-        } else {
-          // Funded account
-          slots[i].status = 'success';
-          slots[i].reason = null;
-          slots[i]._balance = result.balance;
-        }
-      }
-    }
-
-    // ── Step 6: Persist passing wallets ─────────────────────────────────────
-    for (let i = 0; i < count; i++) {
-      if (slots[i].status === 'success') {
-        const record = this.walletService.createWalletRecord(
-          slots[i].publicKey,
-          slots[i]._balance ?? null
-        );
-        slots[i].id = record.id;
-      }
-    }
-
-    // ── Step 7: Assemble results array ───────────────────────────────────────
-    const results = slots.map(slot => ({
-      public_key: slot.publicKey,
-      status: slot.status,
-      reason: slot.reason,
-      id: slot.id,
-    }));
-
-    // ── Step 8: Compute summary ──────────────────────────────────────────────
-    let succeeded = 0;
-    let duplicates = 0;
-    let failed = 0;
-
-    for (const r of results) {
-      if (r.status === 'success') succeeded++;
-      else if (r.status === 'duplicate') duplicates++;
-      else failed++;
-    }
-
-    const summary = {
-      total: count,
-      succeeded,
-      duplicates,
-      failed,
+    return {
+      totalSubmitted: rows.length,
+      totalCreated: created.length,
+      details,
     };
+  }
 
-    return { results, summary };
+  /**
+   * Parse a file buffer and import wallets atomically.
+   *
+   * @param {Buffer} buffer - Raw file content.
+   * @param {'application/json'|'text/csv'} mimeType - Content type.
+   * @returns {{ totalSubmitted: number, totalCreated: number, details: Object[] }}
+   */
+  importFile(buffer, mimeType) {
+    const rows = this.parseFile(buffer, mimeType);
+    return this.importRows(rows);
   }
 }
 

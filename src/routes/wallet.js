@@ -1115,33 +1115,64 @@ router.get('/:id/trustlines', checkPermission(PERMISSIONS.WALLETS_READ), trustli
 module.exports = router;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /wallets/bulk-import  (enterprise tier required)
+// POST /wallets/bulk-import
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { requireTier } = require('../middleware/rbac');
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 /**
  * @route   POST /wallets/bulk-import
- * @desc    Bulk import wallet addresses (enterprise tier only)
- * @access  wallets:create + enterprise tier
+ * @desc    Bulk import wallets from a CSV or JSON file (multipart/form-data, field: "file").
+ *          Atomically inserts all rows or rolls back on any failure.
+ * @access  wallets:create
  */
 router.post(
   '/bulk-import',
   checkPermission(PERMISSIONS.WALLETS_CREATE),
-  requireTier('enterprise'),
-  bulkImportRateLimiter,
-  payloadSizeLimiter(ENDPOINT_LIMITS.bulkImport || 1024 * 1024),
+  upload.single('file'),
   async (req, res, next) => {
     try {
-      const { wallets } = req.body;
-      if (!Array.isArray(wallets) || wallets.length === 0) {
+      if (!req.file) {
         return res.status(400).json({
           success: false,
-          error: { code: 'VALIDATION_ERROR', message: 'wallets must be a non-empty array' },
+          error: { code: 'MISSING_FILE', message: 'A file upload is required (field: "file")' },
         });
       }
-      const result = await BulkWalletImportService.importWallets(wallets, req.user);
-      res.status(207).json({ success: true, data: result });
+
+      const mimeType = req.file.mimetype;
+      const service = new BulkWalletImportService();
+
+      let result;
+      try {
+        result = service.importFile(req.file.buffer, mimeType);
+      } catch (err) {
+        if (err.code === 'ROW_LIMIT_EXCEEDED') {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'ROW_LIMIT_EXCEEDED', message: err.message, limit: err.limit },
+          });
+        }
+        if (err.code === 'VALIDATION_FAILED') {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'VALIDATION_FAILED', message: err.message, details: err.details },
+          });
+        }
+        if (err.code === 'INSERT_FAILED') {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'INSERT_FAILED', message: err.message },
+          });
+        }
+        // Unsupported type or parse error
+        return res.status(400).json({
+          success: false,
+          error: { code: 'PARSE_ERROR', message: err.message },
+        });
+      }
+
+      return res.status(201).json({ success: true, data: result });
     } catch (error) {
       next(error);
     }
