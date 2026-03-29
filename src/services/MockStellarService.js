@@ -2693,6 +2693,37 @@ class MockStellarService extends StellarServiceInterface {
     const key = `${sellingAsset}:${buyingAsset}`;
     return this._orderbookListeners.has(key) ? this._orderbookListeners.get(key).size : 0;
   }
+
+  /**
+   * Mock openChannel
+   */
+  async openChannel(sourceSecret, recipientPublicKey, depositAmount) {
+    const escrowPublicKey = 'G' + crypto.randomBytes(32).toString('hex').toUpperCase().slice(0, 56);
+    const escrowSecret = 'S' + crypto.randomBytes(32).toString('hex').toUpperCase().slice(0, 56);
+    return {
+      escrowPublicKey,
+      escrowSecret,
+      transactionId: 'mock_tx_' + crypto.randomBytes(8).toString('hex'),
+      ledger: Math.floor(Math.random() * 1000000),
+    };
+  }
+
+  /**
+   * Mock updateChannel
+   */
+  async updateChannel(channelId, newAmount) {
+    return { channelId, balance: newAmount, updated: true };
+  }
+
+  /**
+   * Mock closeChannel
+   */
+  async closeChannel(channelId, escrowSecret, recipientPublicKey, amount) {
+    return {
+      transactionId: 'mock_settle_' + crypto.randomBytes(8).toString('hex'),
+      ledger: Math.floor(Math.random() * 1000000),
+    };
+  }
 }
 
 module.exports = MockStellarService;

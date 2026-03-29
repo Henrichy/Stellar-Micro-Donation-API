@@ -508,4 +508,30 @@ router.get('/dashboard', checkPermission(PERMISSIONS.STATS_READ), (req, res, nex
   }
 });
 
+/**
+ * GET /stats/anonymous-breakdown
+ * Get breakdown of anonymous vs identified donations
+ *
+ * Query params:
+ *   startDate {string} - ISO date string (default: 30 days ago)
+ *   endDate   {string} - ISO date string (default: now)
+ */
+router.get('/anonymous-breakdown', checkPermission(PERMISSIONS.STATS_READ), (req, res, next) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const start = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const end = endDate ? new Date(endDate) : new Date();
+
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_PARAM', message: 'Invalid date format' } });
+    }
+
+    const data = StatsService.getAnonymousBreakdown(start, end);
+
+    res.json({ success: true, data });
+  } catch (error) {
+    next(error);
+  }
+});
+
 module.exports = router;

@@ -1884,6 +1884,101 @@ class StellarService extends StellarServiceInterface {
     return close;
   }
 
+  /**
+   * Open a payment channel by creating and funding an escrow account
+   * @param {string} sourceSecret - Source account secret key
+   * @param {string} recipientPublicKey - Recipient public key
+   * @param {string} depositAmount - Amount to deposit in the channel
+   * @returns {Promise<Object>} Transaction result
+   */
+  async openChannel(sourceSecret, recipientPublicKey, depositAmount) {
+    // Create escrow account and fund it
+    const escrowKeypair = StellarSdk.Keypair.random();
+    const escrowPublicKey = escrowKeypair.publicKey();
+
+    // Create account operation
+    const createAccountOp = StellarSdk.Operation.createAccount({
+      destination: escrowPublicKey,
+      startingBalance: depositAmount,
+    });
+
+    // Set options to add recipient as signer
+    const setOptionsOp = StellarSdk.Operation.setOptions({
+      signer: {
+        ed25519PublicKey: recipientPublicKey,
+        weight: 1,
+      },
+    });
+
+    const sourceKeypair = StellarSdk.Keypair.fromSecret(sourceSecret);
+    const account = await this.server.loadAccount(sourceKeypair.publicKey());
+
+    const transaction = new StellarSdk.TransactionBuilder(account, {
+      fee: this.baseFee,
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(createAccountOp)
+      .addOperation(setOptionsOp)
+      .setTimeout(30)
+      .build();
+
+    transaction.sign(sourceKeypair);
+
+    const result = await this.server.submitTransaction(transaction);
+    return {
+      escrowPublicKey,
+      escrowSecret: escrowKeypair.secret(),
+      transactionId: result.hash,
+      ledger: result.ledger,
+    };
+  }
+
+  /**
+   * Update channel balance (off-chain, no Stellar call needed)
+   * @param {string} channelId - Channel ID
+   * @param {string} newAmount - New balance amount
+   * @returns {Promise<Object>} Updated channel state
+   */
+  async updateChannel(channelId, newAmount) {
+    // Off-chain update, just return success
+    return { channelId, balance: newAmount, updated: true };
+  }
+
+  /**
+   * Close channel by submitting settlement transaction
+   * @param {string} channelId - Channel ID
+   * @param {string} escrowSecret - Escrow account secret
+   * @param {string} recipientPublicKey - Recipient public key
+   * @param {string} amount - Amount to settle
+   * @returns {Promise<Object>} Transaction result
+   */
+  async closeChannel(channelId, escrowSecret, recipientPublicKey, amount) {
+    const escrowKeypair = StellarSdk.Keypair.fromSecret(escrowSecret);
+    const account = await this.server.loadAccount(escrowKeypair.publicKey());
+
+    const paymentOp = StellarSdk.Operation.payment({
+      destination: recipientPublicKey,
+      asset: StellarSdk.Asset.native(),
+      amount: amount,
+    });
+
+    const transaction = new StellarSdk.TransactionBuilder(account, {
+      fee: this.baseFee,
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(paymentOp)
+      .setTimeout(30)
+      .build();
+
+    transaction.sign(escrowKeypair);
+
+    const result = await this.server.submitTransaction(transaction);
+    return {
+      transactionId: result.hash,
+      ledger: result.ledger,
+    };
+  }
+
 }
 
 module.exports = StellarService;
