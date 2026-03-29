@@ -11,7 +11,6 @@
 
 const express = require('express');
 const router = express.Router();
-const requireApiKey = require('../middleware/apiKey');
 const { checkPermission, requireAdmin } = require('../middleware/rbac');
 const { PERMISSIONS } = require('../utils/permissions');
 const LimitService = require('../services/LimitService');
@@ -28,11 +27,8 @@ const { validateDataEntry } = require('../middleware/validateDataEntry');
 // eslint-disable-next-line no-unused-vars
 const { sanitizeLabel, sanitizeName } = require('../utils/sanitizer');
 const { payloadSizeLimiter, ENDPOINT_LIMITS } = require('../middleware/payloadSizeLimiter');
-const { bulkImportRateLimiter } = require('../middleware/rateLimiter');
-const BulkWalletImportService = require('../services/BulkWalletImportService');
 
 const walletService = new WalletService(require('../config/serviceContainer').getStellarService());
-const stellarService = require('../config/serviceContainer').getStellarService();
 const AuditLogService = require('../services/AuditLogService');
 const walletCreateSchema = validateSchema({
   body: {
@@ -276,6 +272,125 @@ router.patch('/:id/home-domain', checkPermission(PERMISSIONS.WALLETS_UPDATE), wa
     return res.json({
       success: true,
       data: { homeDomain: domain },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * PUT /wallets/:id/home-domain
+ * Idiomatic alias for PATCH — sets the home domain on a wallet's Stellar account.
+ * Body: { domain: string, sourceSecret: string }
+ */
+router.put('/:id/home-domain', checkPermission(PERMISSIONS.WALLETS_UPDATE), walletIdSchema, async (req, res, next) => {
+  try {
+    const { domain, sourceSecret } = req.body;
+
+    if (!domain || !sourceSecret) {
+      return res.status(400).json({ success: false, error: 'Missing required fields: domain, sourceSecret' });
+    }
+
+    const wallet = walletService.getWalletById(req.params.id);
+
+    const stellarSvc = getStellarService();
+    let result;
+    try {
+      result = await stellarSvc.setHomeDomain(sourceSecret, domain);
+    } catch (err) {
+      if (err && err.name === 'ValidationError') return next(err);
+      return res.status(502).json({ success: false, error: 'Stellar network error while setting home domain' });
+    }
+
+    await AuditLogService.log({
+      category: AuditLogService.CATEGORY.WALLET_OPERATION,
+      action: AuditLogService.ACTION.HOME_DOMAIN_UPDATED,
+      severity: AuditLogService.SEVERITY.MEDIUM,
+      result: 'SUCCESS',
+      userId: req.user && req.user.id,
+      requestId: req.id,
+      ipAddress: req.ip,
+      resource: `/wallets/${req.params.id}/home-domain`,
+      details: { walletId: req.params.id, homeDomain: domain, txHash: result.hash },
+    });
+
+    return res.json({ success: true, data: { homeDomain: domain, hash: result.hash, ledger: result.ledger } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /wallets/:id/home-domain
+ * Returns the current home_domain set on the wallet's Stellar account.
+ */
+router.get('/:id/home-domain', checkPermission(PERMISSIONS.WALLETS_READ), walletIdSchema, async (req, res, next) => {
+  try {
+    const wallet = walletService.getWalletById(req.params.id);
+
+    const stellarSvc = getStellarService();
+    const homeDomain = await stellarSvc.getHomeDomain(wallet.address || wallet.publicKey).catch(() => null);
+
+    return res.json({ success: true, data: { homeDomain: homeDomain || null } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /wallets/:id/home-domain/verify
+ * Fetches https://{domain}/.well-known/stellar.toml and confirms the wallet's
+ * public key is listed under ACCOUNTS.
+ */
+router.post('/:id/home-domain/verify', checkPermission(PERMISSIONS.WALLETS_READ), walletIdSchema, async (req, res, next) => {
+  try {
+    const wallet = walletService.getWalletById(req.params.id);
+
+    const stellarSvc = getStellarService();
+    const publicKey = wallet.address || wallet.publicKey;
+    const homeDomain = await stellarSvc.getHomeDomain(publicKey).catch(() => null);
+
+    if (!homeDomain) {
+      return res.status(400).json({ success: false, error: 'No home domain is set for this wallet' });
+    }
+
+    const https = require('https');
+    const tomlUrl = `https://${homeDomain}/.well-known/stellar.toml`;
+
+    const tomlContent = await new Promise((resolve, reject) => {
+      const req2 = https.get(tomlUrl, { timeout: 5000 }, (response) => {
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          response.resume();
+          return reject(new Error(`stellar.toml returned HTTP ${response.statusCode}`));
+        }
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.on('end', () => resolve(chunks.join('')));
+      });
+      req2.on('timeout', () => { req2.destroy(); reject(new Error('Request timed out after 5 seconds')); });
+      req2.on('error', (err) => reject(err));
+    }).catch((err) => {
+      return res.status(502).json({
+        success: false,
+        error: `Could not fetch stellar.toml from ${tomlUrl}: ${err.message}`,
+      });
+    });
+
+    // If response was already sent (error case above), stop here
+    if (res.headersSent) return;
+
+    const listed = tomlContent.includes(publicKey);
+    if (!listed) {
+      return res.status(422).json({
+        success: false,
+        error: `Account ${publicKey} is not listed in ${tomlUrl}`,
+        data: { homeDomain, publicKey, verified: false },
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: { homeDomain, publicKey, verified: true },
     });
   } catch (error) {
     next(error);
@@ -1178,33 +1293,64 @@ router.get('/:id/trustlines', checkPermission(PERMISSIONS.WALLETS_READ), trustli
 module.exports = router;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /wallets/bulk-import  (enterprise tier required)
+// POST /wallets/bulk-import
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { requireTier } = require('../middleware/rbac');
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 /**
  * @route   POST /wallets/bulk-import
- * @desc    Bulk import wallet addresses (enterprise tier only)
- * @access  wallets:create + enterprise tier
+ * @desc    Bulk import wallets from a CSV or JSON file (multipart/form-data, field: "file").
+ *          Atomically inserts all rows or rolls back on any failure.
+ * @access  wallets:create
  */
 router.post(
   '/bulk-import',
   checkPermission(PERMISSIONS.WALLETS_CREATE),
-  requireTier('enterprise'),
-  bulkImportRateLimiter,
-  payloadSizeLimiter(ENDPOINT_LIMITS.bulkImport || 1024 * 1024),
+  upload.single('file'),
   async (req, res, next) => {
     try {
-      const { wallets } = req.body;
-      if (!Array.isArray(wallets) || wallets.length === 0) {
+      if (!req.file) {
         return res.status(400).json({
           success: false,
-          error: { code: 'VALIDATION_ERROR', message: 'wallets must be a non-empty array' },
+          error: { code: 'MISSING_FILE', message: 'A file upload is required (field: "file")' },
         });
       }
-      const result = await BulkWalletImportService.importWallets(wallets, req.user);
-      res.status(207).json({ success: true, data: result });
+
+      const mimeType = req.file.mimetype;
+      const service = new BulkWalletImportService();
+
+      let result;
+      try {
+        result = service.importFile(req.file.buffer, mimeType);
+      } catch (err) {
+        if (err.code === 'ROW_LIMIT_EXCEEDED') {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'ROW_LIMIT_EXCEEDED', message: err.message, limit: err.limit },
+          });
+        }
+        if (err.code === 'VALIDATION_FAILED') {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'VALIDATION_FAILED', message: err.message, details: err.details },
+          });
+        }
+        if (err.code === 'INSERT_FAILED') {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'INSERT_FAILED', message: err.message },
+          });
+        }
+        // Unsupported type or parse error
+        return res.status(400).json({
+          success: false,
+          error: { code: 'PARSE_ERROR', message: err.message },
+        });
+      }
+
+      return res.status(201).json({ success: true, data: result });
     } catch (error) {
       next(error);
     }
