@@ -134,9 +134,16 @@
 const express = require('express');
 const router = express.Router();
 const Transaction = require('../models/transaction');
-const TransactionSyncService = require('../../services/TransactionSyncService');
-const { buildErrorResponse } = require('../../utils/validationErrorFormatter');
-const sseManager = require('../../services/SseManager');
+const TransactionSyncService = require('../services/TransactionSyncService');
+const MultiSigService = require('../services/MultiSigService');
+const { buildErrorResponse } = require('../utils/validationErrorFormatter');
+const sseManager = require('../services/SseManager');
+const serviceContainer = require('../config/serviceContainer');
+const { checkPermission } = require('../middleware/rbac');
+const { PERMISSIONS } = require('../utils/permissions');
+const { payloadSizeLimiter } = require('../middleware/payloadSizeLimiter');
+const { ENDPOINT_LIMITS } = require('../constants');
+const { validateSchema } = require('../middleware/schemaValidation');
 
 const multiSigService = new MultiSigService(serviceContainer.getStellarService());
 
@@ -221,10 +228,21 @@ router.post(
     try {
       const { publicKey } = req.body;
 
-    if (!publicKey) {
-      return res.status(400).json(
-        buildErrorResponse([{ code: 'MISSING_PUBLIC_KEY', receivedValue: publicKey }])
-      );
+      if (!publicKey) {
+        return res.status(400).json(
+          buildErrorResponse([{ code: 'MISSING_PUBLIC_KEY', receivedValue: publicKey }])
+        );
+      }
+
+      const syncService = new TransactionSyncService(serviceContainer.getStellarService());
+      const result = await syncService.syncWalletTransactions(publicKey);
+
+      return res.status(200).json({
+        success: true,
+        data: result,
+      });
+    } catch (error) {
+      next(error);
     }
   },
 );
