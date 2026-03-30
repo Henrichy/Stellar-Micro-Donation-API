@@ -213,6 +213,37 @@ module.exports = async () => {
     try {
       await Database.run(`ALTER TABLE recurring_donations ADD COLUMN resumedAt DATETIME`);
     } catch (_) {}
+
+    // Webhook tables
+    await Database.run(`CREATE TABLE IF NOT EXISTS webhooks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      url TEXT NOT NULL,
+      events TEXT NOT NULL,
+      secret TEXT,
+      api_key_id INTEGER,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    await Database.run(`CREATE TABLE IF NOT EXISTS webhook_retries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      webhook_id INTEGER NOT NULL,
+      event TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      attempt INTEGER NOT NULL DEFAULT 0,
+      next_retry_at DATETIME NOT NULL,
+      last_error TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    await Database.run(`CREATE TABLE IF NOT EXISTS webhook_dead_letters (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      webhook_id INTEGER NOT NULL,
+      event TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      attempts INTEGER NOT NULL,
+      last_error TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
   } catch (e) {
     // Ignore errors - tables may already exist
   }
