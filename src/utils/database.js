@@ -38,24 +38,15 @@ const DEFAULT_SLOW_QUERY_BUFFER_SIZE = 100;
 const MAX_SLOW_QUERY_ENTRIES = 1000;
 const SLOW_QUERY_WINDOW_MS = 24 * 60 * 60 * 1000;
 
-<<<<<<< fix/issues-686-689
-// Issue #688: Use DB_PATH from environment or config, with sensible default
-const getDbPath = () => {
-=======
 // Resolve database path from environment or use default
 const getDBPath = () => {
->>>>>>> main
   if (process.env.DB_PATH) {
     return process.env.DB_PATH;
   }
   return path.join(__dirname, '../../data/stellar_donations.db');
 };
 
-<<<<<<< fix/issues-686-689
-const DB_PATH = getDbPath();
-=======
 const DB_PATH = getDBPath();
->>>>>>> main
 
 class Database {
   static get poolState() {
@@ -71,6 +62,7 @@ class Database {
         nextConnectionId: 1,
         pendingCreations: 0,
         queueDrainInProgress: false,
+        staleConnectionsReplaced: 0,
       };
     }
 
@@ -864,6 +856,7 @@ class Database {
       waiting: state.waitQueue.length,
       size: state.poolSize,
       acquireTimeout: state.acquireTimeout,
+      staleConnectionsReplaced: state.staleConnectionsReplaced || 0,
     };
   }
 
@@ -910,18 +903,74 @@ class Database {
   }
 
   /**
-   * Ping the database with a lightweight query. On failure, attempt reconnect.
+   * Run a SELECT 1 health check on each idle connection.
+   * Stale connections are removed from the pool and replaced with a fresh one.
+   * @private
+   */
+  static async _checkIdleConnections() {
+    const state = this.poolState;
+    // Snapshot idle connections — avoid mutating while iterating
+    const idleConnections = state.connections.filter(c => !c.inUse);
+
+    for (const connection of idleConnections) {
+      if (state.closing) break;
+
+      try {
+        await withTimeout(
+          new Promise((resolve, reject) => {
+            connection.db.get('SELECT 1 AS ping', [], (err) => {
+              if (err) reject(err); else resolve();
+            });
+          }),
+          TIMEOUT_DEFAULTS.DATABASE,
+          'health_check_ping'
+        );
+      } catch (err) {
+        // Connection is stale — remove it
+        const index = state.connections.findIndex(c => c.id === connection.id);
+        if (index !== -1) {
+          state.connections.splice(index, 1);
+        }
+        try {
+          await this.closeConnectionRecord(connection);
+        } catch (_) {
+          // best-effort close
+        }
+
+        state.staleConnectionsReplaced = (state.staleConnectionsReplaced || 0) + 1;
+        log.warn('DATABASE', 'Stale connection detected and removed from pool', {
+          connectionId: connection.id,
+          error: err.message,
+          staleConnectionsReplaced: state.staleConnectionsReplaced,
+        });
+
+        // Replace with a fresh connection if pool capacity allows
+        if (!state.closing && this.canCreateConnection()) {
+          try {
+            const fresh = await this.createConnectionRecord();
+            fresh.inUse = false;
+            log.info('DATABASE', 'Replaced stale connection with fresh connection', {
+              newConnectionId: fresh.id,
+            });
+          } catch (createErr) {
+            log.warn('DATABASE', 'Failed to create replacement connection', {
+              error: createErr.message,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Ping idle connections individually, then check for pool exhaustion.
    * Emits 'database.degraded' when the pool wait queue is exhausted.
    * @private
    */
   static async _runHealthCheck() {
     if (!this.poolState.initialized || this.poolState.closing) return;
-    try {
-      await this.get('SELECT 1 AS ping');
-    } catch (err) {
-      log.warn('DATABASE', 'Health check failed — attempting reconnect', { error: err.message });
-      await this._reconnectWithBackoff();
-    }
+
+    await this._checkIdleConnections();
 
     // Emit degraded event when pool is exhausted
     const state = this.poolState;
@@ -1020,6 +1069,7 @@ class Database {
     state.nextConnectionId = 1;
     state.pendingCreations = 0;
     state.queueDrainInProgress = false;
+    state.staleConnectionsReplaced = 0;
     state.closing = false;
     this.resetPerformanceMetrics();
   }
