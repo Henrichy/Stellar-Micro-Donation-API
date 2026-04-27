@@ -317,7 +317,10 @@ router.post('/send', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donatio
 
     const response = {
       success: true,
-      data: result
+      data: {
+        ...result,
+        transactionHash: result.stellarTxId || null,
+      },
     };
 
     await storeIdempotencyResponse(req, response);
@@ -821,7 +824,13 @@ router.post('/', donationRateLimiter, checkPermission(PERMISSIONS.DONATIONS_CREA
       requestId: req.id,
     });
 
-    const response = { success: true, data: result };
+    const response = {
+      success: true,
+      data: {
+        ...result,
+        transactionHash: result.stellarTxId || null,
+      },
+    };
     await storeIdempotencyResponse(req, response);
 
     return res.status(201).json(response);
