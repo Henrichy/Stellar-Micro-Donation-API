@@ -222,8 +222,322 @@ const updateDonationStatusSchema = validateSchema({
 });
 
 /**
- * GET /donations/cost-breakdown
- * Return an itemized cost breakdown for a proposed donation.
+ * POST /donations/send
+ * Send XLM from one wallet to another and record it
+ * Requires idempotency key to prevent duplicate transactions
+ * Rate limited: 10 requests per minute per IP
+ */
+router.post('/send', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRateLimiter, requireIdempotency, sendDonationSchema, async (req, res, next) => {
+  try {
+    const { senderId, receiverId, amount, memo, campaign_id } = req.body;
+
+    log.debug('DONATION_ROUTE', 'Processing donation request', {
+      requestId: req.id,
+      senderId,
+      receiverId,
+      amount,
+      hasMemo: !!memo
+    });
+
+    // Validation
+    const requiredValidation = validateRequiredFields(
+      { senderId, receiverId, amount },
+      ['senderId', 'receiverId', 'amount']
+    );
+
+    if (!requiredValidation.valid) {
+      return res.status(400).json({
+        success: false,
+        error: `Missing required fields: ${requiredValidation.missing.join(', ')}`
+      });
+    }
+
+    if (typeof senderId === 'object' || typeof receiverId === 'object') {
+      return res.status(400).json({
+        success: false,
+        error: 'Malformed request: senderId and receiverId must be valid IDs'
+      });
+    }
+
+    const amountValidation = validateFloat(amount);
+    if (!amountValidation.valid) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid amount: ${amountValidation.error}`
+      });
+    }
+
+    // Guard: reject donations to expired campaigns
+    if (campaign_id) {
+      const Database = require('../utils/database');
+      const campaign = await Database.get(
+        `SELECT id, end_date, status FROM campaigns WHERE id = ? AND deleted_at IS NULL`,
+        [campaign_id]
+      );
+      if (!campaign) {
+        return res.status(404).json({ success: false, error: 'Campaign not found' });
+      }
+      const isExpired =
+        campaign.status === 'expired' ||
+        (campaign.end_date && new Date(campaign.end_date) < new Date());
+      if (isExpired) {
+        return res.status(422).json({
+          success: false,
+          error: 'Campaign has ended',
+          campaignId: campaign.id,
+          endedAt: campaign.end_date
+        });
+      }
+    }
+
+    // Delegate to service
+    const result = await donationService.sendCustodialDonation({
+      senderId,
+      receiverId,
+      amount: amountValidation.value,
+      memo,
+      campaign_id,
+      idempotencyKey: req.idempotency.key,
+      requestId: req.id,
+      apiKeyId: req.apiKey ? req.apiKey.id : null,
+      apiKeyRole: req.apiKey ? req.apiKey.role : (req.user?.role || 'user')
+    });
+
+    // Inject remaining limit headers if available
+    if (result.remainingLimits) {
+      const { dailyRemaining, monthlyRemaining } = result.remainingLimits;
+      if (dailyRemaining !== null) res.setHeader('X-Donation-Daily-Remaining', dailyRemaining);
+      if (monthlyRemaining !== null) res.setHeader('X-Donation-Monthly-Remaining', monthlyRemaining);
+    }
+
+    // Mark processing complete
+    if (req.markLifecycleStage) {
+      req.markLifecycleStage(LIFECYCLE_STAGES.PROCESSED);
+    }
+
+    const response = {
+      success: true,
+      data: result
+    };
+
+    await storeIdempotencyResponse(req, response);
+    res.status(201).json(response);
+  } catch (error) {
+    log.error('DONATION_ROUTE', 'Failed to send donation', {
+      requestId: req.id,
+      error: error.message,
+      stack: error.stack
+    });
+
+    // Handle duplicate donation gracefully
+    if (error.name === 'DuplicateError') {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: error.code,
+          message: error.message
+        }
+      });
+    }
+
+    // Pass business logic and other structured errors to the global error handler
+    if (error.statusCode) {
+      return next(error);
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send donation',
+      message: error.message
+    });
+  }
+});
+
+/**
+ * POST /donations/batch
+ * Create up to 100 donations in a single request.
+ * Donations with the same donor are grouped into multi-operation Stellar transactions.
+ * Rate limited: 10 batch requests per minute per IP.
+ */
+router.post('/batch', payloadSizeLimiter(ENDPOINT_LIMITS.batchDonation), safeBatchRateLimiter, requireApiKey, async (req, res, next) => {
+  try {
+    const { donations } = req.body;
+
+    if (!Array.isArray(donations) || donations.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'VALIDATION_ERROR', message: 'donations must be a non-empty array' }
+      });
+    }
+
+    if (donations.length > 100) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'VALIDATION_ERROR', message: 'donations array must not exceed 100 items' }
+      });
+    }
+
+    // Basic per-item validation
+    for (let i = 0; i < donations.length; i++) {
+      const d = donations[i];
+      if (!d.amount || !d.recipient) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'VALIDATION_ERROR', message: `donations[${i}]: amount and recipient are required` }
+        });
+      }
+    }
+
+    const results = await donationService.processBatch(donations);
+
+    const succeeded = results.filter(r => r.success).length;
+    const failed = results.length - succeeded;
+
+    res.status(207).json({
+      success: true,
+      summary: { total: results.length, succeeded, failed },
+      results
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /donations
+ * Create a non-custodial donation record
+ */
+router.post('/', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRateLimiter, requireApiKey, requireIdempotency, createDonationSchema, async (req, res, next) => {
+  try {
+    const { amount, currency, donor, recipient, memo, memoType, notes, tags, sourceAsset, sourceAmount } = req.body;
+
+    // Basic validation
+    if (!amount || !recipient) {
+      throw new ValidationError('Missing required fields: amount, recipient', null, ERROR_CODES.MISSING_REQUIRED_FIELD);
+    }
+
+    if (typeof recipient !== 'string' || (donor && typeof donor !== 'string')) {
+      return res.status(400).json({
+        error: 'Malformed request: donor and recipient must be strings'
+      });
+    }
+
+    const amountValidation = validateFloat(amount);
+    if (!amountValidation.valid) {
+      return res.status(400).json({
+        error: `Invalid amount: ${amountValidation.error}`
+      });
+    }
+
+    let sourceAmountValidation = null;
+    let normalizedSourceAsset = null;
+    if (sourceAsset || sourceAmount) {
+      normalizedSourceAsset = parseAssetInput(sourceAsset, 'sourceAsset');
+      sourceAmountValidation = validateFloat(sourceAmount);
+      if (!sourceAmountValidation.valid) {
+        return res.status(400).json({
+          error: `Invalid sourceAmount: ${sourceAmountValidation.error}`
+        });
+      }
+    }
+
+    // Validate memo type + value combination
+    if (memo || memoType) {
+      const memoValidator = require('../utils/memoValidator');
+      const memoValidation = memoValidator.validateWithType(memo || '', memoType || 'text');
+      if (!memoValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: { code: memoValidation.code, message: memoValidation.error }
+        });
+      }
+    }
+
+    // Resolve federation address if needed (e.g. alice*example.com → GABC...)
+    let resolvedRecipient = recipient;
+    if (federation.isFederationAddress(recipient)) {
+      resolvedRecipient = await federation.resolveRecipient(recipient);
+    }
+
+    // Optionally encrypt memo using recipient's Stellar public key (ECDH)
+    let memoEnvelope = null;
+    let encryptionMetadata = null;
+    if (encryptMemo && memo) {
+      try {
+        const memoEncryption = require('../utils/memoEncryption');
+        memoEnvelope = memoEncryption.encryptMemo(memo, resolvedRecipient);
+        encryptionMetadata = {
+          encrypted: true,
+          algorithm: memoEnvelope.alg,
+          nonce: memoEnvelope.iv,
+        };
+      } catch (encErr) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'MEMO_ENCRYPTION_FAILED', message: encErr.message }
+        });
+      }
+    }
+
+    // Delegate to service
+    const transaction = await donationService.createDonationRecord({
+      amount: amountValidation.value,
+      currency: currency || 'XLM',
+      donor,
+      recipient: resolvedRecipient,
+      memo,
+      sourceAsset: normalizedSourceAsset,
+      sourceAmount: sourceAmountValidation ? sourceAmountValidation.value : undefined,
+      memoType: memoType || 'text',
+      notes,
+      tags,
+      memoEnvelope,
+      encryptionMetadata,
+      idempotencyKey: req.idempotency.key,
+      apiKeyId: req.apiKey ? req.apiKey.id : null,
+      apiKeyRole: req.apiKey ? req.apiKey.role : (req.user?.role || 'user'),
+      anonymous: anonymous === true,
+    });
+
+    // Estimate fee for informational purposes (non-blocking)
+    let feeEstimate = null;
+    try {
+      feeEstimate = await stellarService.estimateFee(1);
+    } catch (_err) {
+      // Fee estimation is best-effort; don't fail the request
+    }
+
+    // Mark processing complete
+    if (req.markLifecycleStage) {
+      req.markLifecycleStage(LIFECYCLE_STAGES.PROCESSED);
+    }
+
+    const response = {
+      success: true,
+      data: {
+        verified: true,
+        transactionHash: transaction.stellarTxId || transaction.id,
+        ...(encryptionMetadata && { encryptionMetadata }),
+        ...(feeEstimate && {
+          estimatedFee: feeEstimate.feeStroops,
+          estimatedFeeXLM: feeEstimate.feeXLM,
+          ...(feeEstimate.surgeProtection && {
+            feeWarning: 'Network fees are elevated (surge pricing active).'
+          }),
+        }),
+      }
+    };
+
+    await storeIdempotencyResponse(req, response);
+    res.status(201).json(response);
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /donations/verify-anonymous
+ * Allow a donor to prove their anonymous donation using their wallet address.
  *
  * Query parameters:
  *   @param {string}  amount              - Donation amount in XLM (required, > 0)

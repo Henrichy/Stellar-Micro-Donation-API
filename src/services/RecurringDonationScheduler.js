@@ -213,85 +213,54 @@ class RecurringDonationScheduler {
    * @returns {Promise<void>}
    */
   async processSchedules() {
-    if (!this.isRunning) return;
+    if (!this.isRunning) {
+      return;
+    }
 
-    return withBackgroundContext('process_schedules', async () => {
-      const { correlationId, traceId } = getCorrelationSummary();
-      // Propagate trace context through scheduler job (issue #632)
-      const traceparent = getCurrentTraceparent();
-      const jobContext = traceparent
-        ? extractTraceContext({ traceparent })
-        : undefined;
+    const correlation = getCorrelationSummary();
 
-      const runWithTrace = (name, fn) =>
-        jobContext
-          ? withSpanInContext(name, jobContext, { 'scheduler.job': 'process_schedules' }, fn)
-          : fn();
+    try {
+      const now = new Date().toISOString();
 
-      return runWithTrace('scheduler.processSchedules', async () => {
-      const _tickStart = Date.now();
-      let _tickFailedSchedules = 0;
+      const dueSchedules = await Database.query(
+        `SELECT
+          rd.id,
+          rd.donorId,
+          rd.recipientId,
+          rd.amount,
+          rd.frequency,
+          rd.nextExecutionDate,
+          rd.executionCount,
+          rd.lastExecutionDate,
+          donor.publicKey as donorPublicKey,
+          recipient.publicKey as recipientPublicKey
+         FROM recurring_donations rd
+         JOIN users donor ON rd.donorId = donor.id
+         JOIN users recipient ON rd.recipientId = recipient.id
+         WHERE rd.status = ?
+         AND rd.nextExecutionDate <= ?`,
+        [SCHEDULE_STATUS.ACTIVE, now]
+      );
+
+      if (dueSchedules.length > 0) {
+        log.info("RECURRING_SCHEDULER", "Found due schedules for execution", {
+          count: dueSchedules.length,
+          correlationId: correlation.correlationId,
+          traceId: correlation.traceId,
+        });
+      }
+
+      const promises = dueSchedules
+        .filter((schedule) => !this.executingSchedules.has(schedule.id))
+        .map((schedule) => this.executeScheduleWithRetry(schedule));
+
+      await Promise.allSettled(promises);
+
+      // Auto-revoke deprecated API keys whose grace period has elapsed
       try {
-        const now = new Date().toISOString();
-
-        // Detect orphaned schedules (donor or recipient no longer exists) and suspend them
-        const orphanedSchedules = await Database.query(
-          `SELECT rd.id
-           FROM recurring_donations rd
-           WHERE rd.status = ?
-             AND (
-               NOT EXISTS (SELECT 1 FROM users WHERE id = rd.donorId)
-               OR NOT EXISTS (SELECT 1 FROM users WHERE id = rd.recipientId)
-             )`,
-          [SCHEDULE_STATUS.ACTIVE]
-        );
-
-        for (const orphan of orphanedSchedules) {
-          const reason = 'Donor or recipient user no longer exists';
-          await Database.run(
-            `UPDATE recurring_donations
-             SET status = 'orphaned', lastFailureReason = ?
-             WHERE id = ?`,
-            [reason, orphan.id]
-          );
-          log.warn('RECURRING_SCHEDULER', 'Schedule marked as orphaned', {
-            scheduleId: orphan.id,
-            reason,
-            correlationId,
-            traceId,
-          });
-        }
-
-        const dueSchedules = await Database.query(
-          `SELECT
-            rd.id,
-            rd.donorId,
-            rd.recipientId,
-            rd.amount,
-            rd.frequency,
-            rd.customIntervalDays,
-            rd.maxExecutions,
-            rd.webhookUrl,
-            rd.failureCount,
-            rd.nextExecutionDate,
-            rd.executionCount,
-            rd.lastExecutionDate,
-            donor.publicKey  AS donorPublicKey,
-            recipient.publicKey AS recipientPublicKey
-           FROM recurring_donations rd
-           JOIN users donor     ON rd.donorId    = donor.id
-           JOIN users recipient ON rd.recipientId = recipient.id
-           WHERE rd.status = ?
-             AND rd.nextExecutionDate <= ?`,
-          [SCHEDULE_STATUS.ACTIVE, now]
-        );
-
-        if (dueSchedules.length > 0) {
-          log.info('RECURRING_SCHEDULER', 'Found due schedules', {
-            count: dueSchedules.length,
-            correlationId,
-            traceId,
-          });
+        const revokedCount = await revokeExpiredDeprecatedKeys();
+        if (revokedCount > 0) {
+          log.info('RECURRING_SCHEDULER', 'Auto-revoked expired deprecated API keys', { revokedCount });
         }
 
         // Track how many schedules are due this tick

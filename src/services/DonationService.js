@@ -1249,15 +1249,10 @@ class DonationService {
    * @returns {{ data: Array, totalCount: number, meta: Object, appliedFilters: Object }} Paginated donations.
    */
   getPaginatedDonations(pagination, filters = {}) {
-    let transactions = Transaction.getAll();
-    if (filters.tag) {
-      transactions = transactions.filter(tx => tx.tags && tx.tags.includes(filters.tag));
-    }
-
     const sortBy = filters.sortBy || 'timestamp';
     const order = filters.order || 'desc';
     const useCustomSort = sortBy !== 'timestamp' || order !== 'desc';
-    const filteredTransactions = this.applyFilters(transactions, filters);
+    const filteredTransactions = this.applyFilters(Transaction.getAll(), filters);
 
     let result = paginateCollection(filteredTransactions, {
       ...pagination,

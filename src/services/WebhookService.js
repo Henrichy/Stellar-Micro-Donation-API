@@ -14,10 +14,14 @@ const http = require('http');
 const crypto = require('crypto');
 const { URL } = require('url');
 const log = require('../utils/log');
-const {
-  getCorrelationContext,
-  withAsyncContext,
-  generateCorrelationHeaders,
+
+const MAX_RETRIES = 3;
+const MAX_CONSECUTIVE_FAILURES = 5;
+const BASE_BACKOFF_MS = 1000;
+const { 
+  getCorrelationContext, 
+  withAsyncContext, 
+  generateCorrelationHeaders 
 } = require('../utils/correlation');
 const { withSpan, injectTraceHeaders } = require('../utils/tracing');
 
@@ -369,17 +373,17 @@ class WebhookService {
 
     return new Promise((resolve) => {
       const transport = parsedUrl.protocol === 'https:' ? https : http;
-      const outboundHeaders = injectTraceHeaders({
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-        'User-Agent': 'Stellar-Donation-API/1.0',
-      });
       const options = {
         hostname: parsedUrl.hostname,
         port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
         path: parsedUrl.pathname + parsedUrl.search,
         method: 'POST',
-        headers: outboundHeaders,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          'User-Agent': 'Stella-Donation-API/1.0',
+          'X-Stella-Event': 'recurring_donation.persistent_failure',
+        },
         timeout: 10000,
       };
 
@@ -390,7 +394,7 @@ class WebhookService {
       });
 
       req.on('timeout', () => { req.destroy(); resolve({ delivered: false, error: 'Request timed out' }); });
-      req.on('error', (err) => resolve({ delivered: false, error: err.message }));
+      req.on('error', (err) => { resolve({ delivered: false, error: err.message }); });
       req.write(body);
       req.end();
     });
@@ -398,41 +402,32 @@ class WebhookService {
 
   /**
    * Deliver an event to all active webhooks subscribed to it.
-   * @param {string} event
-   * @param {object} payload
+   * Fires-and-forgets retries; does not block the caller.
+   * @param {string} event - Event type e.g. 'transaction.confirmed'
+   * @param {object} payload - Event data
    */
-  static async deliver(event, payload) {
-    let webhooks;
+  async deliver(event, payload) {
+    // Capture correlation context from current request
+    const parentContext = getCorrelationContext();
+    let interested = [];
     try {
       const Database = require('../utils/database');
-      webhooks = await Database.all(
+      interested = await Database.query(
         `SELECT * FROM webhooks WHERE is_active = 1 AND (events IS NULL OR events LIKE ?)`,
         [`%${event}%`]
       );
     } catch {
-      return;
+      // webhooks table may not exist in all environments
     }
 
-    if (!webhooks || webhooks.length === 0) return;
-
-    const interested = webhooks.filter(
-      (w) => !w.events || w.events.includes(event)
-    );
-
-    const parentContext = getCorrelationContext();
-
     for (const webhook of interested) {
-      withAsyncContext(
-        'webhook_delivery',
-        async () => {
-          await WebhookService._deliverWithRetry(webhook, event, payload, 0);
-        },
-        {
-          webhookId: webhook.id,
-          event,
-          parentRequestId: parentContext.requestId,
-        }
-      ).catch(() => {});
+      withAsyncContext('webhook_delivery', async () => {
+        await this._deliverWithRetry(webhook, event, payload, 0);
+      }, {
+        webhookId: webhook.id,
+        event,
+        parentRequestId: parentContext.requestId
+      }).catch(() => {});
     }
   }
 
@@ -440,7 +435,7 @@ class WebhookService {
    * Attempt delivery with exponential backoff retry.
    * @private
    */
-  static async _deliverWithRetry(webhook, event, payload, attempt) {
+  async _deliverWithRetry(webhook, event, payload, attempt) {
     const correlationHeaders = generateCorrelationHeaders();
     const body = JSON.stringify({
       event,
@@ -504,15 +499,15 @@ class WebhookService {
    * @param {string} secret
    * @returns {string}
    */
-  static _sign(body, secret) {
-    return crypto.createHmac('sha256', secret || '').update(body).digest('hex');
+  _sign(body, secret) {
+    return crypto.createHmac('sha256', secret).update(body).digest('hex');
   }
 
   /**
    * POST a JSON body to a URL with a timeout.
    * @private
    */
-  static _httpPost(url, body, signature, correlationHeaders = {}) {
+  _httpPost(url, body, signature, correlationHeaders = {}) {
     return new Promise((resolve, reject) => {
       const parsed = new URL(url);
       const lib = parsed.protocol === 'https:' ? https : http;
@@ -524,7 +519,7 @@ class WebhookService {
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
-          'User-Agent': 'Stellar-Donation-API/1.0',
+          'User-Agent': 'Stella-Donation-API/1.0',
           'X-Webhook-Signature': `sha256=${signature}`,
           ...correlationHeaders,
         },
@@ -533,11 +528,8 @@ class WebhookService {
 
       const req = lib.request(options, (res) => {
         res.resume();
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve({ statusCode: res.statusCode });
-        } else {
-          reject(new Error(`HTTP ${res.statusCode}`));
-        }
+        const delivered = res.statusCode >= 200 && res.statusCode < 300;
+        resolve({ delivered, statusCode: res.statusCode });
       });
 
       req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out')); });

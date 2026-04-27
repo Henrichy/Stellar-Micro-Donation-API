@@ -80,32 +80,33 @@ router.post('/', requireApiKey, checkPermission(PERMISSIONS.ADMIN), createCampai
 
 /**
  * GET /campaigns
- * Retrieves active/all campaigns dynamically.
+ * Retrieves campaigns with optional ?status= filter.
+ *
+ * ?status=active (default) — non-expired campaigns only
+ * ?status=expired           — campaigns past their end_date
+ * ?status=all               — all campaigns regardless of end_date
  */
 router.get('/', cacheMiddleware('campaign', 'public'), asyncHandler(async (req, res, next) => {
   try {
-    let query = 'SELECT * FROM campaigns';
-    let params = [];
-    const { status } = req.query;
+    // First, mark any stale 'active' campaigns whose end_date has passed
+    await Database.run(
+      `UPDATE campaigns SET status = 'expired' WHERE status = 'active' AND end_date IS NOT NULL AND end_date < datetime('now')`
+    );
 
-    if (status) {
-      query += ' WHERE status = ?';
-      params.push(status);
+    const status = req.query.status || 'active';
+    let query = 'SELECT * FROM campaigns WHERE deleted_at IS NULL';
+    const params = [];
+
+    if (status === 'active') {
+      query += ` AND status != 'expired' AND (end_date IS NULL OR end_date > datetime('now'))`;
+    } else if (status === 'expired') {
+      query += ` AND (status = 'expired' OR (end_date IS NOT NULL AND end_date < datetime('now')))`;
     }
+    // status=all: no additional filter
 
     query += ' ORDER BY createdAt DESC LIMIT 100';
 
     const campaigns = await Database.query(query, params);
-
-    // Auto-update expired campaigns logically
-    const now = new Date();
-    for (let c of campaigns) {
-      if (c.status === 'active' && c.end_date && new Date(c.end_date) < now) {
-        await Database.run(`UPDATE campaigns SET status = 'completed' WHERE id = ?`, [c.id]);
-        c.status = 'completed';
-      }
-    }
-
     res.status(200).json({ success: true, count: campaigns.length, data: campaigns });
   } catch (error) {
     next(error);
