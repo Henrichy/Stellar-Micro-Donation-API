@@ -97,6 +97,7 @@ const sseManager = require('../services/SseManager');
 const claimableBalancesRoutes = require('./claimableBalances');
 const { requestTimeout, TIMEOUTS } = require('../middleware/requestTimeout');
 const { healthCheckRateLimiter } = require('../middleware/rateLimiter');
+const apiVersionMiddleware = require('../middleware/apiVersion');
 
 const app = express();
 
@@ -243,6 +244,9 @@ app.use((req, res, next) => {
   if (STREAMING_PATH_RE.test(req.path)) return next();
   return requestTimeout(GLOBAL_TIMEOUT_MS)(req, res, next);
 });
+
+// Schema versioning middleware — parses X-Schema-Version header and injects version info
+app.use(apiVersionMiddleware);
 
 // ─── Versioned API Router (issue #738) ───────────────────────────────────────
 // All API routes are mounted under /api/v1
