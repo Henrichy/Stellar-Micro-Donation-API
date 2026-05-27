@@ -277,7 +277,8 @@ apiV1.use('/transactions', transactionRoutes);
 apiV1.use('/', corporateMatchingRoutes);
 apiV1.use('/claimable-balances', claimableBalancesRoutes);
 apiV1.use('/liquidity-pools', require('./liquidity-pools'));
-apiV1.use('/api-keys', apiKeysRoutes);
+const { requireAdminTOTP } = require('../middleware/adminTOTP');
+apiV1.use('/api-keys', requireAdminTOTP(), apiKeysRoutes);
 apiV1.use('/api-keys', apiKeyUsageRoutes);
 
 // Exchange rates endpoint
@@ -491,6 +492,10 @@ app.use('/admin/geo-rules', geoRulesAdminRoutes);
 
 // Backup / restore endpoints (admin only) — mounted at /admin so router defines /backup and /backups paths
 app.use('/admin', backupAdminRoutes);
+
+// TOTP 2FA admin routes (Issue #918)
+const totpAdminRoutes = require('./admin/totp');
+app.use('/admin/totp', requireApiKey, totpAdminRoutes);
 
 // Transaction inspection (admin only)
 app.use('/admin/inspect/xdr', require('../middleware/rbac').requireAdmin(), adminInspectRoutes);
