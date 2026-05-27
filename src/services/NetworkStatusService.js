@@ -39,6 +39,7 @@ class NetworkStatusService extends EventEmitter {
     this._timer = null;
     this._totalPolls = 0;
     this._errorPolls = 0;
+    this._initialized = false;
   }
 
   // ---------------------------------------------------------------------------
@@ -65,7 +66,10 @@ class NetworkStatusService extends EventEmitter {
    * @returns {object}
    */
   getStatus() {
-    return this.currentStatus || this._buildStatus({ connected: false, latencyMs: null, ledgerCloseTimeS: null, feeStroops: null, error: 'No data yet' });
+    if (!this._initialized) {
+      return this._buildStatus({ connected: false, latencyMs: null, ledgerCloseTimeS: null, feeStroops: null, error: 'No data yet' });
+    }
+    return this.currentStatus;
   }
 
   /**
@@ -204,6 +208,7 @@ class NetworkStatusService extends EventEmitter {
   _saveStatus(status) {
     const wasDegraded = this.currentStatus?.degraded;
     this.currentStatus = status;
+    this._initialized = true;
 
     // Append to history and prune
     this._history.push(status);

@@ -25,6 +25,8 @@ const { getStellarService } = require('../config/stellar');
 const { validateRequiredFields, validateFloat } = require('../utils/validationHelpers');
 const log = require('../utils/log');
 const AuditLogService = require('../services/AuditLogService');
+const asyncHandler = require('../utils/asyncHandler');
+const { payloadSizeLimiter, ENDPOINT_LIMITS } = require('../middleware/payloadSizeLimiter');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -95,7 +97,7 @@ async function upsertHolding(assetCode, issuerPublic, holderPublic, delta) {
  * @body {string} distributorPublicKey   - Public key of the distributor receiving the issued supply
  * @body {string} amount                 - Amount to issue
  */
-router.post('/issue', requireAdmin(), async (req, res, next) => {
+router.post('/issue', requireAdmin(), payloadSizeLimiter(ENDPOINT_LIMITS.asset), asyncHandler(async (req, res, next) => {
   try {
     const { issuerSecret, assetCode, distributorPublicKey, amount } = req.body;
 
@@ -155,7 +157,7 @@ router.post('/issue', requireAdmin(), async (req, res, next) => {
   } catch (error) {
     next(error);
   }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /assets/:code/distribute
@@ -171,7 +173,7 @@ router.post('/issue', requireAdmin(), async (req, res, next) => {
  * @body {string} recipientPublicKey - Public key of the recipient
  * @body {string} amount             - Amount to distribute
  */
-router.post('/:code/distribute', requireAdmin(), async (req, res, next) => {
+router.post('/:code/distribute', requireAdmin(), payloadSizeLimiter(ENDPOINT_LIMITS.asset), asyncHandler(async (req, res, next) => {
   try {
     const { code } = req.params;
     const { distributorSecret, issuerPublicKey, recipientPublicKey, amount } = req.body;
@@ -234,7 +236,7 @@ router.post('/:code/distribute', requireAdmin(), async (req, res, next) => {
   } catch (error) {
     next(error);
   }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /assets/burn
@@ -250,7 +252,7 @@ router.post('/:code/distribute', requireAdmin(), async (req, res, next) => {
  * @body {string} issuerPublic  - Issuer public key
  * @body {string} amount        - Amount to burn
  */
-router.post('/burn', checkPermission(PERMISSIONS.DONATIONS_CREATE), async (req, res, next) => {
+router.post('/burn', checkPermission(PERMISSIONS.DONATIONS_CREATE), payloadSizeLimiter(ENDPOINT_LIMITS.asset), asyncHandler(async (req, res, next) => {
   try {
     const { holderSecret, assetCode, issuerPublic, amount } = req.body;
 
@@ -308,7 +310,7 @@ router.post('/burn', checkPermission(PERMISSIONS.DONATIONS_CREATE), async (req, 
   } catch (error) {
     next(error);
   }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /assets/:code/holders
@@ -320,7 +322,7 @@ router.post('/burn', checkPermission(PERMISSIONS.DONATIONS_CREATE), async (req, 
  * @access  donations:read
  * @query   {string} issuer - Issuer public key (required)
  */
-router.get('/:code/holders', checkPermission(PERMISSIONS.DONATIONS_READ), async (req, res, next) => {
+router.get('/:code/holders', checkPermission(PERMISSIONS.DONATIONS_READ), asyncHandler(async (req, res, next) => {
   try {
     const { code } = req.params;
     const { issuer } = req.query;
@@ -354,7 +356,7 @@ router.get('/:code/holders', checkPermission(PERMISSIONS.DONATIONS_READ), async 
   } catch (error) {
     next(error);
   }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /assets/:code/metadata
@@ -366,7 +368,7 @@ router.get('/:code/holders', checkPermission(PERMISSIONS.DONATIONS_READ), async 
  * @access  donations:read
  * @query   {string} issuer - Issuer public key (required)
  */
-router.get('/:code/metadata', checkPermission(PERMISSIONS.DONATIONS_READ), async (req, res, next) => {
+router.get('/:code/metadata', checkPermission(PERMISSIONS.DONATIONS_READ), asyncHandler(async (req, res, next) => {
   try {
     const { code } = req.params;
     const { issuer } = req.query;
@@ -395,7 +397,7 @@ router.get('/:code/metadata', checkPermission(PERMISSIONS.DONATIONS_READ), async
   } catch (error) {
     next(error);
   }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PUT /assets/:code/metadata
@@ -411,7 +413,7 @@ router.get('/:code/metadata', checkPermission(PERMISSIONS.DONATIONS_READ), async
  * @body {string} [description] - Asset description
  * @body {string} [iconUrl]     - URL to asset icon image
  */
-router.put('/:code/metadata', checkPermission(PERMISSIONS.DONATIONS_CREATE), async (req, res, next) => {
+router.put('/:code/metadata', checkPermission(PERMISSIONS.DONATIONS_CREATE), payloadSizeLimiter(ENDPOINT_LIMITS.asset), asyncHandler(async (req, res, next) => {
   try {
     const { code } = req.params;
     const { issuerPublic, name, description, iconUrl } = req.body;
@@ -451,7 +453,7 @@ router.put('/:code/metadata', checkPermission(PERMISSIONS.DONATIONS_CREATE), asy
   } catch (error) {
     next(error);
   }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /assets/:code/clawback
@@ -467,7 +469,7 @@ router.put('/:code/metadata', checkPermission(PERMISSIONS.DONATIONS_CREATE), asy
  * @body {string} amount        - Amount to clawback
  * @body {string} reason        - Required reason for compliance audit trail
  */
-router.post('/:code/clawback', requireAdmin(), async (req, res, next) => {
+router.post('/:code/clawback', requireAdmin(), payloadSizeLimiter(ENDPOINT_LIMITS.asset), asyncHandler(async (req, res, next) => {
   try {
     const { code } = req.params;
     const { issuerSecret, from, amount, reason } = req.body;
@@ -532,6 +534,6 @@ router.post('/:code/clawback', requireAdmin(), async (req, res, next) => {
   } catch (error) {
     next(error);
   }
-});
+}));
 
 module.exports = router;

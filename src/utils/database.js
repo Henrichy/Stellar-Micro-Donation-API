@@ -22,10 +22,44 @@ const { DatabaseError, DuplicateError } = require('./errors');
 const { withTimeout, TIMEOUT_DEFAULTS, TimeoutError } = require('./timeoutHandler');
 const log = require('./log');
 
+// ─── OpenTelemetry helpers ────────────────────────────────────────────────────
+
+/**
+ * Extract the SQL verb from a SQL statement for span naming and db.operation attribute.
+ * Parameter values are never included — only the statement template.
+ *
+ * @param {string} sql - SQL statement (may contain ? placeholders)
+ * @returns {string} Uppercase operation keyword (SELECT, INSERT, UPDATE, DELETE, etc.)
+ */
+function _parseSqlOperation(sql) {
+  if (!sql) return 'UNKNOWN';
+  const match = sql.trimStart().match(/^(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|BEGIN|COMMIT|ROLLBACK)/i);
+  return match ? match[1].toUpperCase() : 'UNKNOWN';
+}
+
+/**
+ * Lazily load the tracing module to avoid circular-dependency issues at startup.
+ * Returns a minimal no-op shim when the module cannot be loaded.
+ *
+ * @returns {{ withSpan: Function }}
+ */
+function _getTracing() {
+  try {
+    return require('./tracing');
+  } catch (_err) {
+    // Tracing unavailable — return no-op shim so DB still functions
+    return {
+      withSpan: async (_name, _attrs, fn) => fn({ setAttribute: () => {}, setStatus: () => {}, recordException: () => {} }),
+    };
+  }
+}
+
 const DEFAULT_POOL_SIZE = 5;
 const DEFAULT_POOL_MIN = 1;
 const DEFAULT_POOL_MAX = 10;
 const DEFAULT_ACQUIRE_TIMEOUT = TIMEOUT_DEFAULTS.DATABASE;
+const DEFAULT_QUERY_TIMEOUT_MS = 5000;
+const SLOW_QUERY_WARN_MS = 1000;
 const HEALTH_CHECK_INTERVAL_MS = 30_000;
 const RECONNECT_BASE_DELAY_MS = 500;
 const RECONNECT_MAX_DELAY_MS = 30_000;
@@ -37,7 +71,16 @@ const DEFAULT_SLOW_QUERY_THRESHOLD_MS = 100;
 const DEFAULT_SLOW_QUERY_BUFFER_SIZE = 100;
 const MAX_SLOW_QUERY_ENTRIES = 1000;
 const SLOW_QUERY_WINDOW_MS = 24 * 60 * 60 * 1000;
-const DB_PATH = path.join(__dirname, '../../data/stellar_donations.db');
+
+// Resolve database path from environment or use default
+const getDBPath = () => {
+  if (process.env.DB_PATH) {
+    return process.env.DB_PATH;
+  }
+  return path.join(__dirname, '../../data/stellar_donations.db');
+};
+
+const DB_PATH = getDBPath();
 
 class Database {
   static get poolState() {
@@ -53,6 +96,7 @@ class Database {
         nextConnectionId: 1,
         pendingCreations: 0,
         queueDrainInProgress: false,
+        staleConnectionsReplaced: 0,
       };
     }
 
@@ -153,6 +197,11 @@ class Database {
         process.env.DB_ACQUIRE_TIMEOUT,
         DEFAULT_ACQUIRE_TIMEOUT
       ),
+      queryTimeoutMs: this.parsePositiveIntegerEnv(
+        'DB_QUERY_TIMEOUT_MS',
+        process.env.DB_QUERY_TIMEOUT_MS,
+        DEFAULT_QUERY_TIMEOUT_MS
+      ),
     };
   }
 
@@ -237,6 +286,15 @@ class Database {
         thresholdMs,
         sql,
         params,
+        failed,
+        timedOut,
+      });
+    } else if (normalizedDurationMs > SLOW_QUERY_WARN_MS) {
+      // Always warn for queries exceeding 1 second regardless of configured threshold (issue #743)
+      log.warn('DATABASE', 'Slow query (>1s)', {
+        method,
+        durationMs: normalizedDurationMs,
+        sql,
         failed,
         timedOut,
       });
@@ -488,6 +546,7 @@ class Database {
       state.poolMin = config.poolMin;
       state.poolMax = config.poolMax;
       state.acquireTimeout = config.acquireTimeout;
+      state.queryTimeoutMs = config.queryTimeoutMs;
       state.closing = false;
       this.performanceState.slowQueryThresholdMs = performanceConfig.slowQueryThresholdMs;
       this.performanceState.slowQueryBufferSize = performanceConfig.slowQueryBufferSize;
@@ -695,6 +754,10 @@ class Database {
   /**
    * Execute a SQLite statement on a pooled connection.
    *
+   * Creates a child OpenTelemetry span for the actual query execution.
+   * Connection acquisition time is excluded from the span duration.
+   * SQL parameter values are NEVER included in span attributes.
+   *
    * @param {'all'|'get'|'run'} method - SQLite method to invoke.
    * @param {string} sql - SQL statement.
    * @param {Array} params - Statement parameters.
@@ -702,86 +765,115 @@ class Database {
    * @returns {Promise<*>} Query result payload.
    */
   static async execute(method, sql, params, failureMessage) {
+    // Acquire the connection BEFORE starting the span so that connection
+    // acquisition time is tracked separately, not included in query duration.
     const lease = await this.acquireConnection();
-    let timedOut = false;
-    let completed = false;
-    const startTimeNs = process.hrtime.bigint();
 
-    let resolveStatement;
-    let rejectStatement;
+    const operation = _parseSqlOperation(sql);
+    const { withSpan } = _getTracing();
 
-    const statementPromise = new Promise((resolve, reject) => {
-      resolveStatement = resolve;
-      rejectStatement = reject;
-    });
+    // SpanKind.CLIENT = 2 (inline to avoid a hard dep on @opentelemetry/api here)
+    return withSpan(
+      `db.${operation.toLowerCase()}`,
+      {
+        'db.system': 'sqlite',
+        'db.operation': operation,
+        // Include the SQL template (with ? placeholders) but NEVER the parameter values
+        'db.statement': sql,
+      },
+      async (span) => {
+        let timedOut = false;
+        let completed = false;
+        const startTimeNs = process.hrtime.bigint();
 
-    statementPromise.catch(() => {});
+        let resolveStatement;
+        let rejectStatement;
 
-    const callback = function(err, result) {
-      const statementContext = this;
-      const durationMs = Number(process.hrtime.bigint() - startTimeNs) / 1e6;
-
-      completed = true;
-      Database.recordQueryExecution({
-        method,
-        sql,
-        params,
-        durationMs,
-        failed: Boolean(err),
-        timedOut,
-      });
-
-      if (err) {
-        rejectStatement(Database.mapDatabaseError(err, failureMessage));
-      } else if (method === 'run') {
-        resolveStatement({ id: statementContext.lastID, changes: statementContext.changes });
-      } else {
-        resolveStatement(result);
-      }
-
-      lease.release({ retire: timedOut }).catch((releaseError) => {
-        log.warn('DATABASE', 'Failed to release pooled connection', {
-          error: releaseError.message,
+        const statementPromise = new Promise((resolve, reject) => {
+          resolveStatement = resolve;
+          rejectStatement = reject;
         });
-      });
-    };
 
-    try {
-      lease.db[method](sql, params, callback);
-    } catch (error) {
-      rejectStatement(Database.mapDatabaseError(error, failureMessage));
-      lease.release({ retire: true }).catch((releaseError) => {
-        log.warn('DATABASE', 'Failed to retire pooled connection after synchronous error', {
-          error: releaseError.message,
-        });
-      });
-    }
+        statementPromise.catch(() => {});
 
-    try {
-      return await withTimeout(
-        statementPromise,
-        TIMEOUT_DEFAULTS.DATABASE,
-        `database_${method}`
-      );
-    } catch (error) {
-      if (error instanceof TimeoutError) {
-        timedOut = true;
-        if (!completed) {
+        const callback = function(err, result) {
+          const statementContext = this;
           const durationMs = Number(process.hrtime.bigint() - startTimeNs) / 1e6;
+
+          completed = true;
           Database.recordQueryExecution({
             method,
             sql,
             params,
             durationMs,
-            failed: true,
-            timedOut: true,
+            failed: Boolean(err),
+            timedOut,
           });
-          completed = true;
-        }
-      }
 
-      throw error;
-    }
+          if (err) {
+            rejectStatement(Database.mapDatabaseError(err, failureMessage));
+          } else if (method === 'run') {
+            const runResult = { id: statementContext.lastID, changes: statementContext.changes };
+            // Record rows affected for write operations
+            span.setAttribute('db.rows_affected', statementContext.changes || 0);
+            resolveStatement(runResult);
+          } else {
+            resolveStatement(result);
+          }
+
+          lease.release({ retire: timedOut }).catch((releaseError) => {
+            log.warn('DATABASE', 'Failed to release pooled connection', {
+              error: releaseError.message,
+            });
+          });
+        };
+
+        try {
+          lease.db[method](sql, params, callback);
+        } catch (error) {
+          rejectStatement(Database.mapDatabaseError(error, failureMessage));
+          lease.release({ retire: true }).catch((releaseError) => {
+            log.warn('DATABASE', 'Failed to retire pooled connection after synchronous error', {
+              error: releaseError.message,
+            });
+          });
+        }
+
+        try {
+          return await withTimeout(
+            statementPromise,
+            this.poolState.queryTimeoutMs || DEFAULT_QUERY_TIMEOUT_MS,
+            `database_${method}`
+          );
+        } catch (error) {
+          if (error instanceof TimeoutError) {
+            timedOut = true;
+            const durationMs = Number(process.hrtime.bigint() - startTimeNs) / 1e6;
+            if (!completed) {
+              Database.recordQueryExecution({
+                method,
+                sql,
+                params,
+                durationMs,
+                failed: true,
+                timedOut: true,
+              });
+              completed = true;
+            }
+            const timeoutError = new DatabaseError(
+              `QUERY_TIMEOUT: query exceeded ${this.poolState.queryTimeoutMs || DEFAULT_QUERY_TIMEOUT_MS}ms (actual: ${durationMs.toFixed(1)}ms) — ${sql.slice(0, 200)}`
+            );
+            timeoutError.code = 'QUERY_TIMEOUT';
+            timeoutError.sql = sql.slice(0, 200);
+            timeoutError.durationMs = durationMs;
+            throw timeoutError;
+          }
+
+          throw error;
+        }
+      },
+      { kind: 2 /* SpanKind.CLIENT */ }
+    );
   }
 
   /**
@@ -846,6 +938,7 @@ class Database {
       waiting: state.waitQueue.length,
       size: state.poolSize,
       acquireTimeout: state.acquireTimeout,
+      staleConnectionsReplaced: state.staleConnectionsReplaced || 0,
     };
   }
 
@@ -892,18 +985,74 @@ class Database {
   }
 
   /**
-   * Ping the database with a lightweight query. On failure, attempt reconnect.
+   * Run a SELECT 1 health check on each idle connection.
+   * Stale connections are removed from the pool and replaced with a fresh one.
+   * @private
+   */
+  static async _checkIdleConnections() {
+    const state = this.poolState;
+    // Snapshot idle connections — avoid mutating while iterating
+    const idleConnections = state.connections.filter(c => !c.inUse);
+
+    for (const connection of idleConnections) {
+      if (state.closing) break;
+
+      try {
+        await withTimeout(
+          new Promise((resolve, reject) => {
+            connection.db.get('SELECT 1 AS ping', [], (err) => {
+              if (err) reject(err); else resolve();
+            });
+          }),
+          TIMEOUT_DEFAULTS.DATABASE,
+          'health_check_ping'
+        );
+      } catch (err) {
+        // Connection is stale — remove it
+        const index = state.connections.findIndex(c => c.id === connection.id);
+        if (index !== -1) {
+          state.connections.splice(index, 1);
+        }
+        try {
+          await this.closeConnectionRecord(connection);
+        } catch (_) {
+          // best-effort close
+        }
+
+        state.staleConnectionsReplaced = (state.staleConnectionsReplaced || 0) + 1;
+        log.warn('DATABASE', 'Stale connection detected and removed from pool', {
+          connectionId: connection.id,
+          error: err.message,
+          staleConnectionsReplaced: state.staleConnectionsReplaced,
+        });
+
+        // Replace with a fresh connection if pool capacity allows
+        if (!state.closing && this.canCreateConnection()) {
+          try {
+            const fresh = await this.createConnectionRecord();
+            fresh.inUse = false;
+            log.info('DATABASE', 'Replaced stale connection with fresh connection', {
+              newConnectionId: fresh.id,
+            });
+          } catch (createErr) {
+            log.warn('DATABASE', 'Failed to create replacement connection', {
+              error: createErr.message,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Ping idle connections individually, then check for pool exhaustion.
    * Emits 'database.degraded' when the pool wait queue is exhausted.
    * @private
    */
   static async _runHealthCheck() {
     if (!this.poolState.initialized || this.poolState.closing) return;
-    try {
-      await this.get('SELECT 1 AS ping');
-    } catch (err) {
-      log.warn('DATABASE', 'Health check failed — attempting reconnect', { error: err.message });
-      await this._reconnectWithBackoff();
-    }
+
+    await this._checkIdleConnections();
 
     // Emit degraded event when pool is exhausted
     const state = this.poolState;
@@ -999,9 +1148,11 @@ class Database {
     state.poolMin = DEFAULT_POOL_MIN;
     state.poolMax = DEFAULT_POOL_MAX;
     state.acquireTimeout = DEFAULT_ACQUIRE_TIMEOUT;
+    state.queryTimeoutMs = DEFAULT_QUERY_TIMEOUT_MS;
     state.nextConnectionId = 1;
     state.pendingCreations = 0;
     state.queueDrainInProgress = false;
+    state.staleConnectionsReplaced = 0;
     state.closing = false;
     this.resetPerformanceMetrics();
   }

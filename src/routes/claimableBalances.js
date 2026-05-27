@@ -7,9 +7,14 @@
  */
 
 const express = require('express');
+const asyncHandler = require('../utils/asyncHandler');
 const router = express.Router();
-const { requireAuth, requirePermission } = require('../middleware/auth');
-const { getStellarService } = require('../utils/serviceLocator');
+const { checkPermission } = require('../middleware/rbac');
+const requireApiKey = require('../middleware/apiKey');
+
+const requireAuth = requireApiKey;
+const requirePermission = (perm) => checkPermission(perm);
+const { getStellarService } = require('../config/stellar');
 
 /**
  * @openapi
@@ -23,7 +28,7 @@ router.post(
   '/',
   requireAuth,
   requirePermission('donations:write'),
-  async (req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     try {
       const { sourceSecret, asset, amount, claimants } = req.body;
       if (!sourceSecret || !amount || !Array.isArray(claimants) || claimants.length === 0) {
@@ -35,14 +40,14 @@ router.post(
     } catch (err) {
       next(err);
     }
-  }
+  })
 );
 
 // POST /claimable-balances/:id/claim
 router.post(
   '/:id/claim',
   requireAuth,
-  async (req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     try {
       const { id } = req.params;
       const { claimantSecret } = req.body;
@@ -58,14 +63,14 @@ router.post(
       }
       next(err);
     }
-  }
+  })
 );
 
 // GET /claimable-balances
 router.get(
   '/',
   requireAuth,
-  async (req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     try {
       const stellarService = getStellarService();
       const wallet = req.user.wallet;
@@ -81,7 +86,7 @@ router.get(
     } catch (err) {
       next(err);
     }
-  }
+  })
 );
 
 module.exports = router;

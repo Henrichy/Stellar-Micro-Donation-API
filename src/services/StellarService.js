@@ -29,6 +29,30 @@ const {
 
 class StellarService extends StellarServiceInterface {
       /**
+       * Submit a pre-signed transaction XDR envelope to the Stellar network.
+       * @param {string} signedXDR - Base64-encoded signed transaction envelope XDR
+       * @returns {Promise<{transactionId: string, hash: string, ledger: number}>}
+       */
+      async submitSignedTransaction(signedXDR) {
+        return StellarErrorHandler.wrap(async () => {
+          if (!signedXDR || typeof signedXDR !== 'string') {
+            const { ValidationError } = require('../utils/errors');
+            throw new ValidationError('signedXDR must be a non-empty string');
+          }
+          const transaction = StellarSdk.TransactionBuilder.fromXDR(signedXDR, this.networkPassphrase);
+          const response = await this._executeWithRetry(
+            () => this.server.submitTransaction(transaction),
+            'submitSignedTransaction'
+          );
+          return {
+            transactionId: response.id,
+            hash: response.hash,
+            ledger: response.ledger,
+          };
+        }, 'submitSignedTransaction');
+      }
+
+      /**
        * List claimable balances claimable by the given public key.
        * @param {string} publicKey - Stellar public key
        * @returns {Promise<Array>} List of claimable balances
@@ -141,6 +165,7 @@ class StellarService extends StellarServiceInterface {
     this.horizonUrl = config.horizonUrl || HORIZON_URLS.TESTNET;
     this.serviceSecretKey = config.serviceSecretKey;
     this.environment = config.environment;
+    this.correlationId = config.correlationId;
     
     // Default to SDK definitions if environment config is missing
     this.baseFee = this.environment?.baseFee || StellarSdk.BASE_FEE;
@@ -148,7 +173,9 @@ class StellarService extends StellarServiceInterface {
       (this.network === 'mainnet' || this.network === 'public' 
         ? StellarSdk.Networks.PUBLIC : StellarSdk.Networks.TESTNET);
 
-    this.server = new StellarSdk.Horizon.Server(this.horizonUrl);
+    this.server = new StellarSdk.Horizon.Server(this.horizonUrl, {
+      httpClient: this._createHttpClient(),
+    });
     
     // Timeout configuration
     this.timeouts = {
@@ -164,6 +191,47 @@ class StellarService extends StellarServiceInterface {
       cooldownMs: config.circuitBreakerCooldownMs ?? 30_000,
       name: 'horizon',
     });
+  }
+
+  /**
+   * Create HTTP client with correlation ID headers
+   * @private
+   * @returns {Object} HTTP client with correlation headers
+   */
+  _createHttpClient() {
+    const { generateCorrelationHeaders } = require('../utils/correlation');
+    const fetch = require('node-fetch');
+    
+    return {
+      async request(method, url, data, headers = {}) {
+        const correlationHeaders = generateCorrelationHeaders();
+        const mergedHeaders = {
+          ...headers,
+          ...correlationHeaders,
+          'X-Request-ID': this.correlationId || correlationHeaders['X-Correlation-ID'],
+        };
+        
+        const response = await fetch(url, {
+          method,
+          headers: mergedHeaders,
+          body: data ? JSON.stringify(data) : undefined,
+        });
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
+        return response.json();
+      }
+    };
+  }
+
+  /**
+   * Set correlation ID for this service instance
+   * @param {string} correlationId - Correlation ID to use for Stellar API calls
+   */
+  setCorrelationId(correlationId) {
+    this.correlationId = correlationId;
   }
 
   getNetwork() {

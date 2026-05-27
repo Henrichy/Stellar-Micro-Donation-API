@@ -37,6 +37,7 @@ const {
   isSameAsset,
   serializeAsset,
 } = require('../utils/stellarAsset');
+const donationEvents = require('../events/donationEvents');
 
 const DEFAULT_DESTINATION_ASSET = {
   type: 'native',
@@ -95,9 +96,64 @@ class DonationService {
    * @param {string} transactionHash - Stellar transaction hash
    * @returns {Promise<Object>} Verification result
    */
-  async verifyTransaction(transactionHash) {
+  async verifyTransaction(transactionHash, donationId) {
     if (!transactionHash) {
       throw new ValidationError('Transaction hash is required', null, ERROR_CODES.INVALID_REQUEST);
+    }
+
+    // When a donationId is supplied, cross-check before hitting the network
+    if (donationId) {
+      const donation = this.getDonationById(donationId);
+
+      // 1. Compare the submitted hash against the stored hash
+      const storedHash = donation.stellarTxId || donation.transactionHash || null;
+      if (storedHash && storedHash !== transactionHash) {
+        throw new ValidationError(
+          'Transaction hash does not match the donation record',
+          { donationId, storedHash, submittedHash: transactionHash },
+          'VERIFICATION_FAILED'
+        );
+      }
+
+      // 2. Fetch on-chain data and compare amount / parties
+      const result = await this.stellarService.verifyTransaction(transactionHash);
+      const onChain = result.transaction;
+
+      if (onChain) {
+        // Compare amount (tolerant of string/number and rounding to 7 decimals)
+        const onChainAmount = parseFloat(onChain.amount);
+        const donationAmount = parseFloat(donation.amount);
+        if (!isNaN(onChainAmount) && !isNaN(donationAmount)) {
+          const diff = Math.abs(onChainAmount - donationAmount);
+          if (diff > 0.0000001) {
+            throw new ValidationError(
+              `Transaction amount mismatch: on-chain ${onChainAmount}, donation record ${donationAmount}`,
+              { donationId, onChainAmount, donationAmount },
+              'VERIFICATION_FAILED'
+            );
+          }
+        }
+
+        // Compare sender (source)
+        if (onChain.source && donation.donor && onChain.source !== donation.donor) {
+          throw new ValidationError(
+            `Transaction sender mismatch: on-chain ${onChain.source}, donation record ${donation.donor}`,
+            { donationId, onChainSource: onChain.source, donationDonor: donation.donor },
+            'VERIFICATION_FAILED'
+          );
+        }
+
+        // Compare recipient (destination)
+        if (onChain.destination && donation.recipient && onChain.destination !== donation.recipient) {
+          throw new ValidationError(
+            `Transaction recipient mismatch: on-chain ${onChain.destination}, donation record ${donation.recipient}`,
+            { donationId, onChainDestination: onChain.destination, donationRecipient: donation.recipient },
+            'VERIFICATION_FAILED'
+          );
+        }
+      }
+
+      return result;
     }
 
     return await this.stellarService.verifyTransaction(transactionHash);
@@ -182,6 +238,28 @@ class DonationService {
     // Decrypt sender's secret key
     const secret = encryption.decrypt(sender.encryptedSecret);
 
+    // Check sender balance before submitting (max 2s to avoid slowing donation flow)
+    try {
+      const { balance } = await withTimeout(
+        this.stellarService.getBalance(sender.publicKey),
+        2000,
+        'balanceCheck'
+      );
+      const available = parseFloat(balance);
+      const reserve = parseFloat(process.env.STELLAR_BASE_RESERVE || '1');
+      const required = parseFloat(amount) + reserve;
+      if (available < required) {
+        throw new BusinessLogicError(
+          ERROR_CODES.INSUFFICIENT_BALANCE,
+          `Insufficient balance. Required: ${required.toFixed(7)} XLM, Available: ${available.toFixed(7)} XLM`
+        );
+      }
+    } catch (err) {
+      if (err instanceof BusinessLogicError) throw err;
+      // Balance check timed out or failed — log and proceed optimistically
+      log.warn('DONATION_SERVICE', 'Balance check skipped', { requestId, error: err.message });
+    }
+
     log.debug('DONATION_SERVICE', 'Initiating Stellar transaction', {
       requestId
     });
@@ -205,6 +283,18 @@ class DonationService {
       'INSERT INTO transactions (senderId, receiverId, amount, memo, notes, tags, timestamp, idempotencyKey, stellar_tx_id) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)',
       [senderId, receiverId, amount, sanitizedMemo, notes || null, JSON.stringify(tags || []), idempotencyKey, stellarResult.transactionId]
     );
+
+    // Emit donation.created to trigger cache invalidation and other listeners (non-blocking)
+    try {
+      donationEvents.emit(donationEvents.constructor.EVENTS?.CREATED || 'donation.created', {
+        id: dbResult.id,
+        senderId,
+        receiverId,
+        amount,
+      });
+    } catch (err) {
+      log.error('DONATION_SERVICE', 'Failed to emit donation.created event', { error: err.message });
+    }
 
     if (campaign_id) {
       await this.processCampaignContribution(campaign_id, amount).catch(err => {
@@ -564,9 +654,16 @@ class DonationService {
     memoEnvelope = null,
     encryptionMetadata = null,
     sdgCategories = [],
+    correlationId = null,
   }) {
     // Sanitize identifiers
     const rawDonor = donor ? sanitizeIdentifier(donor) : 'Anonymous';
+    const rawRecipient = recipient ? sanitizeIdentifier(recipient) : null;
+
+    // Validate donor and recipient are different (check raw values before anonymization)
+    if (rawDonor && rawRecipient && rawDonor !== 'Anonymous' && rawDonor === rawRecipient) {
+      throw new ValidationError('Sender and recipient cannot be the same wallet', null, ERROR_CODES.INVALID_REQUEST);
+    }
 
     // When anonymous=true, replace the real wallet address with a pseudonymous ID
     let sanitizedDonor;
@@ -578,12 +675,7 @@ class DonationService {
       sanitizedDonor = rawDonor;
     }
 
-    const sanitizedRecipient = sanitizeIdentifier(recipient);
-
-    // Validate donor and recipient are different
-    if (sanitizedDonor && sanitizedRecipient && sanitizedDonor === sanitizedRecipient) {
-      throw new ValidationError('Sender and recipient wallets must be different');
-    }
+    const sanitizedRecipient = rawRecipient;
 
     // Validate memo with type-aware validation
     const memoResult = memoType && memoType !== 'text'
@@ -663,6 +755,11 @@ class DonationService {
     if (sourceSecret && sanitizedRecipient) {
       await this.checkRecipientAccountExists(sanitizedRecipient);
       if (!sourceAssetProvided) {
+        // Set correlation ID on StellarService for this request
+        if (correlationId) {
+          this.stellarService.setCorrelationId(correlationId);
+        }
+        
         stellarResult = await this.stellarService.sendDonation({
           sourceSecret,
           destinationPublic: sanitizedRecipient,
@@ -674,6 +771,11 @@ class DonationService {
         });
         paymentMethod = 'direct';
       } else {
+        // Set correlation ID on StellarService for this request
+        if (correlationId) {
+          this.stellarService.setCorrelationId(correlationId);
+        }
+        
         const estimate = await this.stellarService.discoverBestPath({
           sourceAsset: normalizedSourceAsset,
           sourceAmount: normalizedSourceAmount.toString(),
@@ -1133,8 +1235,8 @@ class DonationService {
    * Get all donations
    * @returns {Array} Array of transactions
    */
-  getAllDonations() {
-    return Transaction.getAll();
+  getAllDonations({ includeDeleted = false } = {}) {
+    return Transaction.getAll({ includeDeleted });
   }
 
   /**
@@ -1216,7 +1318,7 @@ class DonationService {
       if (end && new Date(tx.timestamp) > end) return false;
       if (minAmt !== null && tx.amount < minAmt) return false;
       if (maxAmt !== null && tx.amount > maxAmt) return false;
-      if (status && tx.status !== status) return false;
+      if (status && Array.isArray(status) ? !status.includes(tx.status) : (status && tx.status !== status)) return false;
       if (donorLower && !(tx.donor || '').toLowerCase().includes(donorLower)) return false;
       if (recipientLower && !(tx.recipient || '').toLowerCase().includes(recipientLower)) return false;
       if (memoLower && !(tx.memo || '').toLowerCase().includes(memoLower)) return false;
@@ -1254,16 +1356,17 @@ class DonationService {
    * @returns {{ data: Array, totalCount: number, meta: Object, appliedFilters: Object }} Paginated donations.
    */
   getPaginatedDonations(pagination, filters = {}) {
-    let transactions = Transaction.getAll();
-    if (filters.tag) {
-      transactions = transactions.filter(tx => tx.tags && tx.tags.includes(filters.tag));
-    }
-
     const sortBy = filters.sortBy || 'timestamp';
     const order = filters.order || 'desc';
     const useCustomSort = sortBy !== 'timestamp' || order !== 'desc';
-    const filteredTransactions = this.applyFilters(transactions, filters);
+    
+    // Get all transactions and apply filters
+    const filteredTransactions = this.applyFilters(Transaction.getAll(), filters);
+    
+    // Get total count before pagination
+    const totalCount = filteredTransactions.length;
 
+    // Use cursor-based pagination with proper database semantics
     let result = paginateCollection(filteredTransactions, {
       ...pagination,
       timestampField: 'timestamp',
@@ -1286,6 +1389,7 @@ class DonationService {
 
     return {
       ...result,
+      totalCount,
       appliedFilters,
       resultCount: result.totalCount,
     };
@@ -1436,17 +1540,44 @@ class DonationService {
    * @returns {Object} Updated transaction
    */
   updateDonationStatus(id, status, stellarData = {}) {
-    const validStatuses = Object.values(TRANSACTION_STATES);
-    if (!validStatuses.includes(status)) {
-      throw new ValidationError(`Invalid status. Must be one of: ${validStatuses.join(', ')}`);
-    }
+    const { assertValidState, assertValidTransition, normalizeState } = require('../utils/transactionStateMachine');
+    
+    // Normalize and validate the new status
+    const normalizedStatus = normalizeState(status);
+    assertValidState(normalizedStatus, 'status');
+
+    // Get current donation to check state transition
+    const currentDonation = this.getDonationById(id);
+    const currentStatus = normalizeState(currentDonation.status);
+
+    // Validate state transition
+    assertValidTransition(currentStatus, normalizedStatus);
 
     const updateData = { ...stellarData };
-    if (status === 'confirmed') {
+    if (normalizedStatus === 'confirmed') {
       updateData.confirmedAt = new Date().toISOString();
     }
 
-    return Transaction.updateStatus(id, status, updateData);
+    const updated = Transaction.updateStatus(id, normalizedStatus, updateData);
+
+    // Emit donation lifecycle event for SSE subscribers and other listeners
+    const eventMap = {
+      submitted: donationEvents.constructor.EVENTS?.SUBMITTED || 'donation.submitted',
+      confirmed: donationEvents.constructor.EVENTS?.CONFIRMED || 'donation.confirmed',
+      failed: donationEvents.constructor.EVENTS?.FAILED || 'donation.failed',
+    };
+    const eventName = eventMap[normalizedStatus];
+    if (eventName) {
+      donationEvents.emitLifecycleEvent(eventName, {
+        donationId: updated.id,
+        status: normalizedStatus,
+        txHash: updated.stellar_tx_id || stellarData.transactionId,
+        ledger: updated.ledger || stellarData.ledger,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    return updated;
   }
 
   /**
@@ -1474,8 +1605,8 @@ class DonationService {
    * @throws {ValidationError} If donation is not eligible for refund
    * @throws {BusinessLogicError} If refund fails
    */
-  async refundDonation(donationId, { reason, requestId }) {
-    const { BusinessLogicError } = require('../utils/errors');
+  async refundDonation(donationId, { reason, notes, idempotencyKey, recipientSecret, requestId }) {
+    const { BusinessLogicError, DuplicateError } = require('../utils/errors');
     const config = require('../config');
     const AuditLogService = require('./AuditLogService');
 
@@ -1488,20 +1619,39 @@ class DonationService {
     // Get the original donation
     const donation = this.getDonationById(donationId);
 
+    // Idempotency: if idempotencyKey provided, check for existing refund with same key
+    if (idempotencyKey) {
+      const existing = await Database.get(
+        `SELECT * FROM refunds WHERE idempotency_key = ? LIMIT 1`,
+        [idempotencyKey]
+      ).catch(() => null);
+      if (existing) {
+        return {
+          refundId: existing.id,
+          originalDonationId: donationId,
+          reverseTxId: existing.reverse_transaction_id,
+          amount: existing.amount,
+          reason: existing.reason,
+          refundedAt: existing.refunded_at,
+          status: existing.status,
+          alreadyProcessed: true,
+        };
+      }
+    }
+
     // Check if donation is already refunded
     if (donation.status === 'refunded') {
-      throw new BusinessLogicError(
-        ERROR_CODES.TRANSACTION_FAILED,
+      throw new DuplicateError(
         'Donation has already been refunded',
-        { donationId, currentStatus: donation.status }
+        ERROR_CODES.DUPLICATE_DONATION
       );
     }
 
-    // Check if donation is confirmed
-    if (donation.status !== TRANSACTION_STATES.CONFIRMED) {
+    // Check if donation is in completed/confirmed status
+    if (donation.status !== TRANSACTION_STATES.CONFIRMED && donation.status !== 'completed') {
       throw new BusinessLogicError(
         ERROR_CODES.TRANSACTION_FAILED,
-        `Cannot refund donation with status "${donation.status}". Only confirmed donations can be refunded.`,
+        `Cannot refund donation with status "${donation.status}". Only completed donations can be refunded.`,
         { donationId, currentStatus: donation.status }
       );
     }
@@ -1525,18 +1675,25 @@ class DonationService {
       );
     }
 
-    // Get sender (original recipient becomes sender for reverse transaction)
-    const sender = await this.getUserById(donation.senderId || 1, 'Sender');
-    this.validateSenderSecret(sender);
-
-    // Decrypt sender's secret key
-    const secret = encryption.decrypt(sender.encryptedSecret);
+    // Determine the secret key to use for signing the refund transaction.
+    // If the caller provides recipientSecret (over HTTPS), use it directly and never log it.
+    // Otherwise fall back to the encrypted secret stored in the DB.
+    let secret;
+    if (recipientSecret) {
+      // Use caller-provided key in-memory only — never log this value
+      secret = recipientSecret;
+    } else {
+      const sender = await this.getUserById(donation.senderId || 1, 'Sender');
+      this.validateSenderSecret(sender);
+      secret = encryption.decrypt(sender.encryptedSecret);
+    }
 
     log.debug('DONATION_SERVICE', 'Creating reverse Stellar transaction', {
       requestId,
       donationId,
       amount: donation.amount,
       originalTxId: donation.stellarTxId
+      // NOTE: secret key is intentionally NOT logged
     });
 
     // Create reverse Stellar transaction
@@ -1547,6 +1704,9 @@ class DonationService {
       memo: `REFUND:${donationId}`
     });
 
+    // Immediately discard the secret from local scope
+    secret = null;
+
     log.debug('DONATION_SERVICE', 'Reverse transaction successful', {
       requestId,
       reverseTxId: reverseResult.transactionId,
@@ -1556,16 +1716,18 @@ class DonationService {
     // Record refund in database
     const refundRecord = await Database.run(
       `INSERT INTO refunds (
-        original_donation_id, reverse_transaction_id, amount, reason, 
-        refunded_at, stellar_ledger, status
-      ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)`,
+        original_donation_id, reverse_transaction_id, amount, reason, notes,
+        idempotency_key, refunded_at, stellar_ledger, status
+      ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)`,
       [
         donationId,
         reverseResult.transactionId,
         donation.amount,
         reason || 'No reason provided',
+        notes || null,
+        idempotencyKey || null,
         reverseResult.ledger,
-        'pending'
+        'completed'
       ]
     );
 
@@ -1610,9 +1772,12 @@ class DonationService {
       reverseTxId: reverseResult.transactionId,
       reverseLedger: reverseResult.ledger,
       amount: donation.amount,
+      refundedAmount: donation.amount,
+      networkFeeDeducted: 0,
       reason,
+      notes: notes || null,
       refundedAt: new Date().toISOString(),
-      status: 'pending'
+      status: 'completed',
     };
   }
 }

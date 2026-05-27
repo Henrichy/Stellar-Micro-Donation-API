@@ -34,6 +34,7 @@ const featureFlagsAdminRoutes = require('./admin/featureFlags');
 const createFeeBumpRouter = require('./admin/feeBump');
 const dbAdminRoutes = require('./admin/db');
 const adminTracesRoutes = require('./admin/traces');
+const systemInfoRoutes = require('./admin/systemInfo');
 const retentionAdminRoutes = require('./admin/retention');
 const backupAdminRoutes = require('./admin/backup');
 const geoRulesAdminRoutes = require('./admin/geoRules');
@@ -68,11 +69,12 @@ const log = require('../utils/log');
 const requestId = require('../middleware/requestId');
 const { attachLifecycleTracking } = require('../middleware/requestLifecycle');
 const serviceContainer = require('../config/serviceContainer');
-const { payloadSizeLimiter } = require('../middleware/payloadSizeLimiter');
+const { payloadSizeLimiter, ENDPOINT_LIMITS } = require('../middleware/payloadSizeLimiter');
 const { createCorsMiddleware } = require('../middleware/cors');
-const { createCspMiddleware, cspReportRouter } = require('../middleware/csp');
+const { createPathBasedCspMiddleware, cspReportRouter } = require('../middleware/csp');
 const { responseFormatterMiddleware } = require('../utils/responseFormatter');
 const trackQuotaUsage = require('../middleware/quotaTracker');
+const asyncHandler = require('../utils/asyncHandler');
 const { startQuotaResetJob } = require('../jobs/quotaResetJob');
 const { createDeduplicationMiddleware } = require('../middleware/deduplication');
 const { fieldFilterMiddleware } = require('../middleware/fieldFilter');
@@ -93,6 +95,8 @@ const { metricsMiddleware, registry } = require('../utils/metrics');
 const { attachSubscriptionServer } = require('../graphql');
 const sseManager = require('../services/SseManager');
 const claimableBalancesRoutes = require('./claimableBalances');
+const { requestTimeout, TIMEOUTS } = require('../middleware/requestTimeout');
+const { healthCheckRateLimiter } = require('../middleware/rateLimiter');
 
 const app = express();
 
@@ -107,6 +111,7 @@ const stellarService = serviceContainer.getStellarService();
 const reconciliationService = serviceContainer.getTransactionReconciliationService();
 const recurringDonationScheduler = serviceContainer.getRecurringDonationScheduler();
 const networkStatusService = serviceContainer.getNetworkStatusService();
+setNetworkService(networkStatusService);
 const transactionSyncScheduler = serviceContainer.getTransactionSyncScheduler();
 
 // Initialize replay detection cleanup timer (will be started in startServer)
@@ -151,13 +156,9 @@ app.use(attachLifecycleTracking);
 // Attach res.success / res.failure envelope helpers (must be after requestId)
 app.use(responseFormatterMiddleware());
 // Security headers (helmet must be early, before routes)
+// contentSecurityPolicy disabled here - owned by createPathBasedCspMiddleware below
 app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'none'"],
-      frameAncestors: ["'none'"],
-    },
-  },
+  contentSecurityPolicy: false,
   frameguard: { action: 'deny' },
   noSniff: true,
   referrerPolicy: { policy: 'no-referrer' },
@@ -166,22 +167,22 @@ app.use(helmet({
     includeSubDomains: true,
     preload: true,
   },
-  xssFilter: false,         // deprecated header — omit for API servers
+  xssFilter: false,         // deprecated header - omit for API servers
   hidePoweredBy: true,
 }));
 
 // CORS (must be before body parsers and route handlers)
 app.use(createCorsMiddleware());
 
-// CSP: per-request nonce + strict directives (after helmet, before routes)
-app.use(createCspMiddleware());
+// CSP: strict for API routes, relaxed for /docs + /api/docs (Swagger UI) — Issue #757
+app.use(createPathBasedCspMiddleware());
 app.use(cspReportRouter);
 
 // Geographic IP blocking (must be before body parsers)
 app.use(require('../middleware/geoBlock'));
 
 // Payload size limit (must be before body parsers)
-app.use(payloadSizeLimiter);
+app.use(payloadSizeLimiter());
 
 app.use(express.json({
   verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); }
@@ -193,6 +194,9 @@ app.use(require('../middleware/blockCheck'));
 
 // Request/Response logging middleware
 app.use(logger.middleware());
+
+// Structured access log middleware (#721) — one entry per request with requestId, timing, status
+app.use(require('../middleware/accessLog')());
 
 // Abuse detection (observability only - no blocking)
 app.use(abuseDetectionMiddleware);
@@ -213,46 +217,71 @@ app.use(trackQuotaUsage);
 app.use(metricsMiddleware);
 
 // GET /metrics — Prometheus scrape endpoint (admin only)
-app.get('/metrics', requireApiKey, requireAdmin(), async (req, res) => {
-  res.set('Content-Type', registry.contentType);
-  res.end(await registry.metrics());
-});
+app.get('/metrics', requireApiKey, requireAdmin(), asyncHandler(async (req, res) => {
+  try {
+    res.set('Content-Type', registry.contentType);
+    res.end(await registry.metrics());
+  } catch (err) {
+    log.error('METRICS', 'Failed to generate metrics', { error: err.message });
+    res.status(503).json({
+      success: false,
+      error: { code: 'METRICS_ERROR', message: 'Failed to generate metrics' }
+    });
+  }
+}));
 // Content-based request deduplication (for requests without idempotency keys)
 app.use(createDeduplicationMiddleware());
 
 // Response field filtering (?fields=id,amount,status)
 app.use(fieldFilterMiddleware());
 
-// Routes
-app.use('/wallets', walletRoutes);
-app.use('/wallets', thresholdsRouter);
-app.use('/', recoveryRoutes);
-app.use('/donations', donationRoutes);
-app.use('/donations', require('./receipt'));
-app.use('/donations/recurring', recurringDonationRoutes);
-app.use('/assets', assetRoutes);
-app.use('/stats', statsRoutes);
-app.use('/stream', streamRoutes);
-app.use('/network', networkRoutes);
-app.use('/webhooks', webhooksRoutes);
-app.use('/campaigns', campaignsRoutes);
-app.use('/encryption', encryptionRoutes);
-app.use('/tiers', tiersRoutes);
-app.use('/offers', offersRoutes);
-app.use('/orderbook/:baseAsset/:counterAsset', require('./orderbook'));
-app.use('/tags', tagsRoutes);
-app.use('/leaderboard', leaderboardRoutes);
-app.use('/federation', federationLookupRoutes);
-app.use('/tools', toolsRoutes);
-app.use('/auth', authRoutes);
-app.use('/docs', docsRoutes);
-app.use('/transactions', transactionRoutes);
-app.use('/', corporateMatchingRoutes);
-app.use('/claimable-balances', claimableBalancesRoutes);
-app.use('/liquidity-pools', require('./liquidity-pools'));
+// Global request timeout — exempt SSE, WebSocket, and stream endpoints
+// Configurable via REQUEST_TIMEOUT_MS env var (default 30 s).
+const GLOBAL_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS, 10) || TIMEOUTS.donation;
+const STREAMING_PATH_RE = /\/(stream|sse|events|ws|websocket|subscribe)(\/|$)/i;
+app.use((req, res, next) => {
+  if (STREAMING_PATH_RE.test(req.path)) return next();
+  return requestTimeout(GLOBAL_TIMEOUT_MS)(req, res, next);
+});
+
+// ─── Versioned API Router (issue #738) ───────────────────────────────────────
+// All API routes are mounted under /api/v1
+const apiV1 = express.Router();
+
+// Public endpoints — mounted before requireApiKey middleware
+apiV1.use('/fees', feesRoutes);
+
+apiV1.use('/wallets', walletRoutes);
+apiV1.use('/wallets', thresholdsRouter);
+apiV1.use('/', recoveryRoutes);
+apiV1.use('/donations', donationRoutes);
+apiV1.use('/donations', require('./receipt'));
+apiV1.use('/donations/recurring', recurringDonationRoutes);
+apiV1.use('/assets', assetRoutes);
+apiV1.use('/stats', statsRoutes);
+apiV1.use('/stream', streamRoutes);
+apiV1.use('/network', networkRoutes);
+apiV1.use('/webhooks', webhooksRoutes);
+apiV1.use('/campaigns', campaignsRoutes);
+apiV1.use('/encryption', encryptionRoutes);
+apiV1.use('/tiers', tiersRoutes);
+apiV1.use('/offers', offersRoutes);
+apiV1.use('/orderbook/:baseAsset/:counterAsset', require('./orderbook'));
+apiV1.use('/tags', tagsRoutes);
+apiV1.use('/leaderboard', leaderboardRoutes);
+apiV1.use('/federation', federationLookupRoutes);
+apiV1.use('/tools', toolsRoutes);
+apiV1.use('/auth', authRoutes);
+apiV1.use('/docs', docsRoutes);
+apiV1.use('/transactions', transactionRoutes);
+apiV1.use('/', corporateMatchingRoutes);
+apiV1.use('/claimable-balances', claimableBalancesRoutes);
+apiV1.use('/liquidity-pools', require('./liquidity-pools'));
+apiV1.use('/api-keys', apiKeysRoutes);
+apiV1.use('/api-keys', apiKeyUsageRoutes);
 
 // Exchange rates endpoint
-app.get('/exchange-rates', async (req, res) => {
+apiV1.get('/exchange-rates', asyncHandler(async (req, res) => {
   try {
     const priceOracle = require('../services/PriceOracleService');
     const rates = await priceOracle.getRates();
@@ -272,6 +301,30 @@ app.get('/exchange-rates', async (req, res) => {
       error: { code: 'EXCHANGE_RATE_UNAVAILABLE', message: err.message },
     });
   }
+}));
+
+// Mount versioned router
+app.use('/api/v1', apiV1);
+
+// ─── Deprecation redirects for unversioned paths (issue #738) ────────────────
+// Redirect legacy unversioned paths to /api/v1 with a deprecation warning header.
+// Paths that are intentionally unversioned (/health, /metrics, /admin/*, /.well-known/*)
+// are excluded from redirection.
+const UNVERSIONED_PATHS = [
+  '/wallets', '/donations', '/assets', '/stats', '/stream', '/network',
+  '/webhooks', '/campaigns', '/encryption', '/tiers', '/offers', '/orderbook',
+  '/tags', '/leaderboard', '/federation', '/tools', '/auth', '/docs',
+  '/transactions', '/claimable-balances', '/liquidity-pools', '/exchange-rates',
+];
+
+app.use((req, res, next) => {
+  const matchesLegacy = UNVERSIONED_PATHS.some(p => req.path === p || req.path.startsWith(p + '/'));
+  if (!matchesLegacy) return next();
+
+  res.set('Deprecation', 'true');
+  res.set('Link', `</api/v1${req.path}>; rel="successor-version"`);
+  res.set('Sunset', 'Sat, 01 Jan 2027 00:00:00 GMT');
+  return res.redirect(308, `/api/v1${req.url}`);
 });
 
 // SEP-0010 Stellar TOML discovery endpoint
@@ -292,42 +345,88 @@ app.get('/.well-known/stellar.toml', (req, res) => {
   res.type('text/plain').send(tomlContents.join('\n'));
 });
 
-// ─── OpenAPI / Swagger UI (issue #634) ───────────────────────────────────────
+// ─── OpenAPI / Swagger UI (issue #634, #740) ─────────────────────────────────
 try {
   const { spec, swaggerUiMiddleware, swaggerUiSetup } = require('../config/openapi');
   app.use('/api/docs', swaggerUiMiddleware, swaggerUiSetup);
   app.get('/api/openapi.json', (req, res) => res.json(spec));
+  // #740: also serve at /docs in development mode
+  if (process.env.NODE_ENV !== 'production') {
+    app.use('/docs', swaggerUiMiddleware, swaggerUiSetup);
+    app.get('/openapi.json', (req, res) => res.json(spec));
+  }
 } catch (_err) {
   // swagger-jsdoc / swagger-ui-express not installed — skip silently
 }
 
 // Health check endpoint
-// Health check endpoints
-app.get('/health', async (req, res) => {
-  const health = await HealthCheckService.getFullHealth(stellarService, networkStatusService);
-  const stellarConfig = require('../config/stellar');
-  health.stellarEnvironment = stellarConfig.environment || 'testnet';
-  health.stellarNetwork = stellarConfig.network || 'testnet';
-  health.clientIp = req.ip;
-  health.protocol = req.protocol;
-  health.requestId = req.id;
-  health.transactionSync = transactionSyncScheduler.getSyncStatus();
-  
-  const httpStatus = health.status === 'unhealthy' ? 503 : 200;
-  return res.status(httpStatus).json(health);
+// Health check endpoints — available at both /health (unversioned) and /api/v1/health (versioned)
+const healthHandler = asyncHandler(async (req, res) => {
+  try {
+    // Issue #889: Check for verbose mode (admin only)
+    const isAdmin = req.apiKey?.role === 'admin' || req.user?.role === 'admin';
+    const verbose = req.query.verbose === 'true' && isAdmin;
+    
+    // In production, unauthenticated requests get minimal response
+    const isProduction = process.env.NODE_ENV === 'production';
+    const shouldMinimize = isProduction && !isAdmin;
+    
+    const health = await HealthCheckService.getFullHealth(
+      stellarService, 
+      networkStatusService, 
+      recurringDonationScheduler,
+      verbose && !shouldMinimize
+    );
+    
+    // Issue #889: Minimize response in production for unauthenticated requests
+    if (shouldMinimize) {
+      return res.status(health.status === 'healthy' ? 200 : 503).json({
+        status: health.status,
+        timestamp: health.timestamp
+      });
+    }
+    
+    health.stellarEnvironment = stellarConfig.environment || 'testnet';
+    health.stellarNetwork = stellarConfig.network || 'testnet';
+    health.requestId = req.id;
+    health.transactionSync = transactionSyncScheduler.getSyncStatus();
+
+    const httpStatus = health.status === 'healthy' ? 200 : 503;
+    return res.status(httpStatus).json(health);
+  } catch (err) {
+    log.error('HEALTH', 'Health check failed', { error: err.message });
+    return res.status(503).json({
+      success: false,
+      status: 'unhealthy',
+      error: { code: 'HEALTH_CHECK_ERROR', message: 'Health check failed' }
+    });
+  }
 });
 
+app.get('/api/v1/health', healthCheckRateLimiter, healthHandler);
+
+app.get('/health', healthCheckRateLimiter, healthHandler);
+
 // Liveness probe — returns 200 as long as the process is running
-app.get('/health/live', (req, res) => {
+app.get('/health/live', healthCheckRateLimiter, (req, res) => {
   return res.status(200).json(HealthCheckService.getLiveness());
 });
 
 // Readiness probe — returns 200 only when all dependencies are healthy
-app.get('/health/ready', async (req, res) => {
-  const readiness = await HealthCheckService.getReadiness(stellarService, networkStatusService);
-  const httpStatus = readiness.ready ? 200 : 503;
-  return res.status(httpStatus).json(readiness);
-});
+app.get('/health/ready', healthCheckRateLimiter, asyncHandler(async (req, res) => {
+  try {
+    const readiness = await HealthCheckService.getReadiness(stellarService, networkStatusService, recurringDonationScheduler);
+    const httpStatus = readiness.ready ? 200 : 503;
+    return res.status(httpStatus).json(readiness);
+  } catch (err) {
+    log.error('HEALTH', 'Readiness check failed', { error: err.message });
+    return res.status(503).json({
+      success: false,
+      ready: false,
+      error: { code: 'READINESS_CHECK_ERROR', message: 'Readiness check failed' }
+    });
+  }
+}));
 
 // Abuse detection stats endpoint (admin only)
 app.get('/abuse-signals', require('../middleware/rbac').requireAdmin(), (req, res) => {
@@ -393,18 +492,50 @@ app.use('/admin/inspect/xdr', require('../middleware/rbac').requireAdmin(), admi
 // Audit log export (Issue #604) - async jobs with signed download URLs
 app.use('/admin/audit-logs/export', require('./admin/auditLogExport'));
 
-// Audit logs endpoint (admin only)
-app.get('/admin/audit-logs', require('../middleware/rbac').requireAdmin(), async (req, res, next) => {
+// Audit logs endpoint (admin only) — #796: mandatory pagination, default 50, max 500
+const AUDIT_LOG_DEFAULT_LIMIT = 50;
+const AUDIT_LOG_MAX_LIMIT = 500;
+
+app.get('/admin/audit-logs', require('../middleware/rbac').requireAdmin(), asyncHandler(async (req, res, next) => {
   try {
-    const pagination = parseCursorPaginationQuery(req.query);
+    // Parse and enforce limit bounds (default 50, max 500)
+    let limit = AUDIT_LOG_DEFAULT_LIMIT;
+    if (req.query.limit !== undefined) {
+      const parsed = parseInt(req.query.limit, 10);
+      if (isNaN(parsed) || parsed < 1) {
+        return res.status(400).json({ success: false, error: { code: 'INVALID_LIMIT', message: 'limit must be a positive integer' } });
+      }
+      if (parsed > AUDIT_LOG_MAX_LIMIT) {
+        return res.status(400).json({ success: false, error: { code: 'LIMIT_TOO_LARGE', message: `limit cannot exceed ${AUDIT_LOG_MAX_LIMIT}` } });
+      }
+      limit = parsed;
+    }
+
+    // Allowlist validation — reject unknown enum values before they reach the DB layer
+    const VALID_CATEGORIES = new Set(Object.values(AuditLogService.CATEGORY));
+    const VALID_SEVERITIES = new Set(Object.values(AuditLogService.SEVERITY));
+
+    if (req.query.category && !VALID_CATEGORIES.has(req.query.category)) {
+      return res.status(400).json({ success: false, error: 'Invalid category value' });
+    }
+    if (req.query.severity && !VALID_SEVERITIES.has(req.query.severity)) {
+      return res.status(400).json({ success: false, error: 'Invalid severity value' });
+    }
+
+    // Parse cursor using existing utility but override limit
+    const pagination = parseCursorPaginationQuery({ ...req.query, limit: String(limit) });
+    pagination.limit = limit; // ensure our validated limit is used
+
     const filters = {
       category: req.query.category,
       action: req.query.action,
       severity: req.query.severity,
-      userId: req.query.userId,
+      // actorId maps to userId in the schema
+      userId: req.query.actorId || req.query.userId,
       requestId: req.query.requestId,
-      startDate: req.query.startDate,
-      endDate: req.query.endDate,
+      // from/to map to startDate/endDate
+      startDate: req.query.from || req.query.startDate,
+      endDate: req.query.to || req.query.endDate,
     };
 
     const result = await AuditLogService.queryPaginated(filters, pagination);
@@ -414,15 +545,21 @@ app.get('/admin/audit-logs', require('../middleware/rbac').requireAdmin(), async
       success: true,
       data: result.data,
       count: result.data.length,
-      meta: result.meta
+      pagination: {
+        limit,
+        cursor: result.meta.next_cursor || null,
+        hasMore: result.meta.next_cursor !== null,
+        total: result.totalCount,
+      },
+      meta: result.meta,
     });
   } catch (error) {
     next(error);
   }
-});
+}));
 
 // Manual reconciliation trigger (admin only)
-app.post('/reconcile', require('../middleware/rbac').requireAdmin(), async (req, res, next) => {
+app.post('/reconcile', require('../middleware/rbac').requireAdmin(), payloadSizeLimiter(ENDPOINT_LIMITS.admin), payloadSizeLimiter(ENDPOINT_LIMITS.admin), asyncHandler(async (req, res, next) => {
   try {
     if (reconciliationService.reconciliationInProgress) {
       return res.status(409).json({
@@ -441,10 +578,10 @@ app.post('/reconcile', require('../middleware/rbac').requireAdmin(), async (req,
   } catch (error) {
     next(error);
   }
-});
+}));
 
 // Admin reconcile endpoint (canonical path)
-app.post('/admin/reconcile', require('../middleware/rbac').requireAdmin(), async (req, res, next) => {
+app.post('/admin/reconcile', require('../middleware/rbac').requireAdmin(), payloadSizeLimiter(ENDPOINT_LIMITS.admin), asyncHandler(async (req, res, next) => {
   try {
     if (reconciliationService.reconciliationInProgress) {
       return res.status(409).json({
@@ -462,10 +599,10 @@ app.post('/admin/reconcile', require('../middleware/rbac').requireAdmin(), async
   } catch (error) {
     next(error);
   }
-});
+}));
 
 // Admin sync endpoint — triggers immediate transaction sync for all wallets
-app.post('/admin/sync', require('../middleware/rbac').requireAdmin(), async (req, res, next) => {
+app.post('/admin/sync', require('../middleware/rbac').requireAdmin(), payloadSizeLimiter(ENDPOINT_LIMITS.admin), asyncHandler(async (req, res, next) => {
   try {
     const result = await transactionSyncScheduler.syncAllWallets();
     res.json({
@@ -476,10 +613,10 @@ app.post('/admin/sync', require('../middleware/rbac').requireAdmin(), async (req
   } catch (error) {
     next(error);
   }
-});
+}));
 
 // Orphaned transactions stats (admin only)
-app.get('/admin/orphaned-transactions', require('../middleware/rbac').requireAdmin(), async (req, res, next) => {
+app.get('/admin/orphaned-transactions', require('../middleware/rbac').requireAdmin(), asyncHandler(async (req, res, next) => {
   try {
     const rows = await Database.query(
       'SELECT id, senderId, receiverId, amount, memo, timestamp, stellar_tx_id FROM transactions WHERE is_orphan = 1 ORDER BY timestamp DESC',
@@ -497,7 +634,7 @@ app.get('/admin/orphaned-transactions', require('../middleware/rbac').requireAdm
   } catch (error) {
     next(error);
   }
-});
+}));
 
 // 404 handler (must be after all routes)
 app.use(notFoundHandler);
@@ -507,98 +644,137 @@ app.use(errorHandler);
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
-  log.error('APP', 'Unhandled promise rejection', {
-    reason,
-    promise,
+  // Extract error details from reason object
+  const errorDetails = {
+    message: reason?.message || String(reason),
+    stack: reason?.stack,
+    name: reason?.name,
+    code: reason?.code,
     timestamp: new Date().toISOString()
-  });
+  };
+  
+  log.error('APP', 'Unhandled promise rejection', errorDetails);
 });
+
+process.on('uncaughtException', (error) => {
+  // Extract error details from error object
+  const errorDetails = {
+    message: error?.message || String(error),
+    stack: error?.stack,
+    name: error?.name,
+    code: error?.code,
+    timestamp: new Date().toISOString()
+  };
+  
+  log.error('APP', 'Uncaught exception', errorDetails);
+  // Exit process after logging uncaught exception
+  process.exit(1);
+});
+
+const PORT = config.server.port;
 
 let cleanupInterval = null;
 
 async function startServer() {
   try {
     await logStartupDiagnostics();
-    const { runMigrations } = require('../utils/migrationRunner');
-    await runMigrations();
-    await initializeApiKeysTable();
-    
-    // Initialize feature flags table
-    const { initializeFeatureFlagsTable, loadFlagsFromEnv } = require('../utils/featureFlags');
-    await initializeFeatureFlagsTable();
-    if (process.env.FEATURE_FLAGS) {
-      await loadFlagsFromEnv(process.env.FEATURE_FLAGS);
-    }
-    
-    await WebhookService.initTable();
-    await validateRBAC();
 
-    const server = app.listen(PORT, async () => {
-      // Attach GraphQL WebSocket subscription server
-      attachSubscriptionServer(server);
+    // #714: Bind the HTTP port immediately so /health/live is reachable right away.
+    // Critical DB/schema init and background services run asynchronously after bind.
+    const server = app.listen(PORT);
 
-      // Attach real-time balance streaming WebSocket
-      require('../services/websocketService').attach(server);
-
-      // Only start background workers and jobs if not in test environment
-      if (process.env.NODE_ENV !== 'test') {
-        const stopQuotaResetJob = startQuotaResetJob();
-        server.stopQuotaResetJob = stopQuotaResetJob;
-
-        // Start pledge expiry worker
-        require('../workers/expiryWorker').start();
-
-        recurringDonationScheduler.start();
-        reconciliationService.start();
-        auditLogRetentionService.start();
-        transactionSyncScheduler.start();
-        sseManager.start();
-        
-        runCleanup(); // Run once on startup
-        cleanupInterval = setInterval(runCleanup, 24 * 60 * 60 * 1000);
+    // #715: Handle EADDRINUSE with a clear, actionable error message.
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        log.error('APP', `Port ${PORT} is already in use. Stop the existing process or set a different PORT in your .env file.`, { port: PORT });
+        process.exit(1);
       }
-      
-      // Initialize and start network status monitoring
-      networkStatusService.on('network.degraded', (status) => {
-        log.warn('NETWORK_STATUS', 'Network status degraded', { status });
-      });
+      throw err;
+    });
 
+    await new Promise((resolve) => server.once('listening', resolve));
+
+    log.info('APP', 'HTTP server listening', {
+      port: PORT,
+      healthCheck: `http://localhost:${PORT}/health`,
+    });
+
+    // Attach WebSocket servers immediately after bind
+    attachSubscriptionServer(server);
+    require('../services/websocketService').attach(server);
+
+    // Run critical init (DB migrations, table setup) asynchronously after port is bound.
+    // /health/ready will return false until this completes.
+    setImmediate(async () => {
       try {
-        await networkStatusService.initialize();
-      } catch (err) {
-        log.error('APP', 'Failed to initialize NetworkStatusService', {
-          error: err.message,
+        const { runMigrations } = require('../utils/migrationRunner');
+        await runMigrations();
+        await initializeApiKeysTable();
+
+        const { initializeFeatureFlagsTable, loadFlagsFromEnv } = require('../utils/featureFlags');
+        await initializeFeatureFlagsTable();
+        if (process.env.FEATURE_FLAGS) {
+          await loadFlagsFromEnv(process.env.FEATURE_FLAGS);
+        }
+
+        await WebhookService.WebhookService.initTable();
+        await validateRBAC();
+
+        // Only start background workers and jobs if not in test environment
+        if (process.env.NODE_ENV !== 'test') {
+          const stopQuotaResetJob = startQuotaResetJob();
+          server.stopQuotaResetJob = stopQuotaResetJob;
+
+          require('../workers/expiryWorker').start();
+          recurringDonationScheduler.start();
+          reconciliationService.start();
+          auditLogRetentionService.start();
+          transactionSyncScheduler.start();
+          sseManager.start();
+
+          runCleanup();
+          cleanupInterval = setInterval(runCleanup, 24 * 60 * 60 * 1000);
+        }
+
+        // Initialize network status monitoring
+        networkStatusService.on('network.degraded', (status) => {
+          log.warn('NETWORK_STATUS', 'Network status degraded', { status });
         });
-      }
+        try {
+          networkStatusService.start();
+        } catch (err) {
+          log.error('APP', 'Failed to initialize NetworkStatusService', { error: err.message });
+        }
 
-      const { startCleanup } = require('../utils/replayDetector');
-      const replayConfig = require('../config/replayDetection');
-      replayCleanupTimer = startCleanup(replayDetectionMiddleware.trackingStore, replayConfig);
+        const { startCleanup } = require('../utils/replayDetector');
+        const replayConfig = require('../config/replayDetection');
+        replayCleanupTimer = startCleanup(replayDetectionMiddleware.trackingStore, replayConfig);
 
-      // Initialize Leaderboard SSE for real-time updates
-      try {
-        const LeaderboardSSE = require('../services/LeaderboardSSE');
-        LeaderboardSSE.initLeaderboardSSE();
-      } catch (err) {
-        log.error('APP', 'Failed to initialize LeaderboardSSE', {
-          error: err.message,
-        });
-      }
+        try {
+          const LeaderboardSSE = require('../services/LeaderboardSSE');
+          LeaderboardSSE.initLeaderboardSSE();
+        } catch (err) {
+          log.error('APP', 'Failed to initialize LeaderboardSSE', { error: err.message });
+        }
 
-      log.info('APP', 'API started', {
-        port: PORT,
-        network: config.network,
-        healthCheck: `http://localhost:${PORT}/health`
-      });
-
-      if (log.isDebugMode) {
-        log.debug('APP', 'Debug mode enabled - verbose logging active');
-        log.debug('APP', 'Configuration loaded', {
+        log.info('APP', 'API ready', {
           port: PORT,
-          network: stellarConfig.network,
+          network: config.network,
           healthCheck: `http://localhost:${PORT}/health`,
-          environment: config.server.env,
         });
+
+        if (log.isDebugMode) {
+          log.debug('APP', 'Debug mode enabled - verbose logging active');
+          log.debug('APP', 'Configuration loaded', {
+            port: PORT,
+            network: stellarConfig.network,
+            healthCheck: `http://localhost:${PORT}/health`,
+            environment: config.server.env,
+          });
+        }
+      } catch (initErr) {
+        log.error('APP', 'Background initialization failed', { error: initErr.message });
+        process.exit(1);
       }
     });
 
@@ -650,12 +826,13 @@ async function startServer() {
           log.error("SHUTDOWN", "Error flushing webhooks", { error: err.message });
         }
 
-        // Stop recurring donation scheduler and wait for running job
+        // Stop recurring donation scheduler and wait for in-progress executions
         try {
-          await recurringDonationScheduler.stopGracefully
-            ? recurringDonationScheduler.stopGracefully()
-            : recurringDonationScheduler.stop();
-          log.info("SHUTDOWN", "Scheduler stopped");
+          const schedulerResult = await recurringDonationScheduler.stopGracefully(timeoutMs);
+          log.info("SHUTDOWN", "Scheduler stopped", {
+            waited: schedulerResult?.waited ?? 0,
+            interrupted: schedulerResult?.interrupted ?? 0,
+          });
         } catch (err) {
           log.error("SHUTDOWN", "Error stopping scheduler", { error: err.message });
         }
@@ -674,7 +851,7 @@ async function startServer() {
         }
         
         try {
-          await networkStatusService.shutdown();
+          networkStatusService.stop();
         } catch (err) {
           log.error("SHUTDOWN", "Error shutting down NetworkStatusService", { error: err.message });
         }
@@ -682,6 +859,14 @@ async function startServer() {
         if (replayCleanupTimer) {
           clearInterval(replayCleanupTimer);
           log.info("SHUTDOWN", "Replay detection cleanup timer stopped");
+        }
+
+        // Checkpoint SQLite WAL before closing
+        try {
+          await Database.run('PRAGMA wal_checkpoint(TRUNCATE)');
+          log.info("SHUTDOWN", "SQLite WAL checkpoint completed");
+        } catch (err) {
+          log.warn("SHUTDOWN", "Error checkpointing WAL", { error: err.message });
         }
 
         await Database.close();

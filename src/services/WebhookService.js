@@ -14,20 +14,26 @@ const http = require('http');
 const crypto = require('crypto');
 const { URL } = require('url');
 const log = require('../utils/log');
-const {
-  getCorrelationContext,
-  withAsyncContext,
-  generateCorrelationHeaders,
+
+const MAX_RETRIES = 3;
+const MAX_CONSECUTIVE_FAILURES = 5;
+const BASE_BACKOFF_MS = 1000;
+const { 
+  getCorrelationContext, 
+  withAsyncContext, 
+  generateCorrelationHeaders 
 } = require('../utils/correlation');
 const { withSpan, injectTraceHeaders } = require('../utils/tracing');
 
-const MAX_RETRIES = 3;
-const BASE_BACKOFF_MS = 1000;
-const MAX_CONSECUTIVE_FAILURES = 5;
-
 /** Retry queue constants */
-const RETRY_BASE_DELAY_MS = 30_000;   // 30 s
-const RETRY_MAX_ATTEMPTS = 6;
+const RETRY_DELAYS_MS = [
+  60 * 1000,        // 1 minute
+  5 * 60 * 1000,    // 5 minutes
+  30 * 60 * 1000,   // 30 minutes
+  2 * 60 * 60 * 1000,  // 2 hours
+  24 * 60 * 60 * 1000  // 24 hours
+];
+const RETRY_MAX_ATTEMPTS = 5;
 
 class WebhookService {
   /**
@@ -45,6 +51,7 @@ class WebhookService {
         api_key_id INTEGER,
         is_active INTEGER NOT NULL DEFAULT 1,
         consecutive_failures INTEGER NOT NULL DEFAULT 0,
+        owner_email TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
@@ -71,6 +78,19 @@ class WebhookService {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    await Database.run(`
+      CREATE TABLE IF NOT EXISTS webhook_delivery_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        webhook_id INTEGER NOT NULL,
+        event TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        attempt INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL,
+        status_code INTEGER,
+        error_message TEXT,
+        delivered_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
   }
 
   /**
@@ -80,22 +100,39 @@ class WebhookService {
    * @param {string[]} params.events
    * @param {string} [params.secret]
    * @param {number|null} [params.apiKeyId]
+   * @param {string} [params.ownerEmail]
    * @returns {Promise<Object>}
    */
-  async register({ url, events, secret, apiKeyId = null }) {
+  async register({ url, events, secret, apiKeyId = null, ownerEmail = null, tlsSkipVerify = false }) {
     if (!url) { const e = new Error('url is required'); e.status = 400; throw e; }
     if (!events || events.length === 0) { const e = new Error('events must be a non-empty array'); e.status = 400; throw e; }
-    try { new URL(url); } catch { const e = new Error('Invalid webhook URL'); e.status = 400; throw e; }
+
+    let parsedUrl;
+    try { parsedUrl = new URL(url); } catch { const e = new Error('Invalid webhook URL'); e.status = 400; throw e; }
+
+    // Enforce HTTPS — allow http://localhost and http://127.0.0.1 in development only
+    if (parsedUrl.protocol !== 'https:') {
+      const isLocalhost = parsedUrl.hostname === 'localhost' || parsedUrl.hostname === '127.0.0.1';
+      const isDev = process.env.NODE_ENV !== 'production';
+      if (!(isLocalhost && isDev)) {
+        const e = new Error('Webhook URL must use HTTPS'); e.status = 400; throw e;
+      }
+    }
+
+    // tlsSkipVerify is not allowed in production
+    if (tlsSkipVerify && process.env.NODE_ENV === 'production') {
+      const e = new Error('tlsSkipVerify is not allowed in production'); e.status = 400; throw e;
+    }
 
     const resolvedSecret = secret || crypto.randomBytes(20).toString('hex');
     const eventsStr = JSON.stringify(events);
 
     const Database = require('../utils/database');
     const result = await Database.run(
-      `INSERT INTO webhooks (url, events, secret, api_key_id) VALUES (?, ?, ?, ?)`,
-      [url, eventsStr, resolvedSecret, apiKeyId]
+      `INSERT INTO webhooks (url, events, secret, api_key_id, owner_email, tls_skip_verify) VALUES (?, ?, ?, ?, ?, ?)`,
+      [url, eventsStr, resolvedSecret, apiKeyId, ownerEmail, tlsSkipVerify ? 1 : 0]
     );
-    return { id: result.id, url, events, secret: resolvedSecret, isActive: true };
+    return { id: result.id, url, events, secret: resolvedSecret, isActive: true, ownerEmail, tlsSkipVerify: !!tlsSkipVerify };
   }
 
   /**
@@ -129,8 +166,9 @@ class WebhookService {
 
   /**
    * Schedule a retry for a failed webhook delivery.
-   * Exponential backoff: delay = RETRY_BASE_DELAY_MS * 2^attempt (capped at RETRY_MAX_ATTEMPTS).
-   * Promotes to dead-letter when max attempts exceeded.
+   * Uses fixed delays: 1min, 5min, 30min, 2hr, 24hr
+   * Promotes to dead-letter when max attempts (5) exceeded.
+   * Notifies webhook owner after final failure.
    *
    * @param {Object} params
    * @param {number} params.webhookId
@@ -143,6 +181,13 @@ class WebhookService {
   static async scheduleRetry({ webhookId, event, payload, attempt = 0, lastError = null }) {
     const Database = require('../utils/database');
 
+    // Log delivery attempt
+    await Database.run(
+      `INSERT INTO webhook_delivery_history (webhook_id, event, payload, attempt, status, error_message)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [webhookId, event, JSON.stringify(payload), attempt + 1, 'failed', lastError]
+    );
+
     if (attempt >= RETRY_MAX_ATTEMPTS) {
       await Database.run(
         `INSERT INTO webhook_dead_letters (webhook_id, event, payload, attempts, last_error)
@@ -150,10 +195,17 @@ class WebhookService {
         [webhookId, event, JSON.stringify(payload), attempt, lastError]
       );
       log.warn('WEBHOOK_SERVICE', 'Delivery moved to dead-letter', { webhookId, event, attempt });
+      
+      // Notify webhook owner
+      const webhook = await Database.get(`SELECT * FROM webhooks WHERE id = ?`, [webhookId]);
+      if (webhook && webhook.owner_email) {
+        await WebhookService._notifyOwnerOfFailure(webhook, event, attempt, lastError);
+      }
+      
       return;
     }
 
-    const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+    const delayMs = RETRY_DELAYS_MS[attempt];
     const nextRetryAt = new Date(Date.now() + delayMs).toISOString();
 
     await Database.run(
@@ -247,6 +299,65 @@ class WebhookService {
   }
 
   /**
+   * Get delivery history for a specific webhook.
+   * @param {number} webhookId
+   * @param {Object} options
+   * @param {number} [options.limit=50]
+   * @param {number} [options.offset=0]
+   * @returns {Promise<Object[]>}
+   */
+  static async getDeliveryHistory(webhookId, { limit = 50, offset = 0 } = {}) {
+    const Database = require('../utils/database');
+    const rows = await Database.all(
+      `SELECT * FROM webhook_delivery_history 
+       WHERE webhook_id = ? 
+       ORDER BY delivered_at DESC 
+       LIMIT ? OFFSET ?`,
+      [webhookId, limit, offset]
+    );
+    return rows.map(r => ({
+      id: r.id,
+      webhookId: r.webhook_id,
+      event: r.event,
+      payload: (() => { try { return JSON.parse(r.payload); } catch { return r.payload; } })(),
+      attempt: r.attempt,
+      status: r.status,
+      statusCode: r.status_code,
+      errorMessage: r.error_message,
+      deliveredAt: r.delivered_at,
+    }));
+  }
+
+  /**
+   * Notify webhook owner of repeated failures.
+   * @private
+   * @param {Object} webhook
+   * @param {string} event
+   * @param {number} attempts
+   * @param {string} lastError
+   * @returns {Promise<void>}
+   */
+  static async _notifyOwnerOfFailure(webhook, event, attempts, lastError) {
+    log.warn('WEBHOOK_SERVICE', 'Notifying owner of webhook failure', {
+      webhookId: webhook.id,
+      ownerEmail: webhook.owner_email,
+      event,
+      attempts
+    });
+
+    // In a real implementation, this would send an email
+    // For now, we just log it
+    // TODO: Integrate with email service
+    const notification = {
+      to: webhook.owner_email,
+      subject: `Webhook Delivery Failed: ${webhook.url}`,
+      body: `Your webhook (ID: ${webhook.id}) at ${webhook.url} has failed after ${attempts} attempts.\n\nEvent: ${event}\nLast Error: ${lastError}\n\nPlease check your endpoint and consider updating the webhook configuration.`
+    };
+
+    log.info('WEBHOOK_SERVICE', 'Owner notification prepared', notification);
+  }
+
+  /**
    * Send a failure notification to a single webhook URL.
    *
    * @param {string} webhookUrl - Target URL (http or https)
@@ -274,17 +385,17 @@ class WebhookService {
 
     return new Promise((resolve) => {
       const transport = parsedUrl.protocol === 'https:' ? https : http;
-      const outboundHeaders = injectTraceHeaders({
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-        'User-Agent': 'Stellar-Donation-API/1.0',
-      });
       const options = {
         hostname: parsedUrl.hostname,
         port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
         path: parsedUrl.pathname + parsedUrl.search,
         method: 'POST',
-        headers: outboundHeaders,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          'User-Agent': 'Stella-Donation-API/1.0',
+          'X-Stella-Event': 'recurring_donation.persistent_failure',
+        },
         timeout: 10000,
       };
 
@@ -295,7 +406,7 @@ class WebhookService {
       });
 
       req.on('timeout', () => { req.destroy(); resolve({ delivered: false, error: 'Request timed out' }); });
-      req.on('error', (err) => resolve({ delivered: false, error: err.message }));
+      req.on('error', (err) => { resolve({ delivered: false, error: err.message }); });
       req.write(body);
       req.end();
     });
@@ -303,41 +414,32 @@ class WebhookService {
 
   /**
    * Deliver an event to all active webhooks subscribed to it.
-   * @param {string} event
-   * @param {object} payload
+   * Fires-and-forgets retries; does not block the caller.
+   * @param {string} event - Event type e.g. 'transaction.confirmed'
+   * @param {object} payload - Event data
    */
-  static async deliver(event, payload) {
-    let webhooks;
+  async deliver(event, payload) {
+    // Capture correlation context from current request
+    const parentContext = getCorrelationContext();
+    let interested = [];
     try {
       const Database = require('../utils/database');
-      webhooks = await Database.all(
+      interested = await Database.query(
         `SELECT * FROM webhooks WHERE is_active = 1 AND (events IS NULL OR events LIKE ?)`,
         [`%${event}%`]
       );
     } catch {
-      return;
+      // webhooks table may not exist in all environments
     }
 
-    if (!webhooks || webhooks.length === 0) return;
-
-    const interested = webhooks.filter(
-      (w) => !w.events || w.events.includes(event)
-    );
-
-    const parentContext = getCorrelationContext();
-
     for (const webhook of interested) {
-      withAsyncContext(
-        'webhook_delivery',
-        async () => {
-          await WebhookService._deliverWithRetry(webhook, event, payload, 0);
-        },
-        {
-          webhookId: webhook.id,
-          event,
-          parentRequestId: parentContext.requestId,
-        }
-      ).catch(() => {});
+      withAsyncContext('webhook_delivery', async () => {
+        await this._deliverWithRetry(webhook, event, payload, 0);
+      }, {
+        webhookId: webhook.id,
+        event,
+        parentRequestId: parentContext.requestId
+      }).catch(() => {});
     }
   }
 
@@ -345,7 +447,7 @@ class WebhookService {
    * Attempt delivery with exponential backoff retry.
    * @private
    */
-  static async _deliverWithRetry(webhook, event, payload, attempt) {
+  async _deliverWithRetry(webhook, event, payload, attempt) {
     const correlationHeaders = generateCorrelationHeaders();
     const body = JSON.stringify({
       event,
@@ -360,8 +462,16 @@ class WebhookService {
     const signature = WebhookService._sign(body, webhook.secret || '');
 
     try {
-      await WebhookService._httpPost(webhook.url, body, signature, correlationHeaders);
+      const result = await WebhookService._httpPost(webhook.url, body, signature, correlationHeaders, !!webhook.tls_skip_verify);
+      
+      // Log successful delivery
       const Database = require('../utils/database');
+      await Database.run(
+        `INSERT INTO webhook_delivery_history (webhook_id, event, payload, attempt, status, status_code)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [webhook.id, event, JSON.stringify(payload), attempt + 1, 'success', result.statusCode]
+      ).catch(() => {});
+      
       await Database.run(
         `UPDATE webhooks SET consecutive_failures = 0 WHERE id = ?`,
         [webhook.id]
@@ -401,15 +511,15 @@ class WebhookService {
    * @param {string} secret
    * @returns {string}
    */
-  static _sign(body, secret) {
-    return crypto.createHmac('sha256', secret || '').update(body).digest('hex');
+  _sign(body, secret) {
+    return crypto.createHmac('sha256', secret).update(body).digest('hex');
   }
 
   /**
    * POST a JSON body to a URL with a timeout.
    * @private
    */
-  static _httpPost(url, body, signature, correlationHeaders = {}) {
+  _httpPost(url, body, signature, correlationHeaders = {}, tlsSkipVerify = false) {
     return new Promise((resolve, reject) => {
       const parsed = new URL(url);
       const lib = parsed.protocol === 'https:' ? https : http;
@@ -421,20 +531,19 @@ class WebhookService {
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
-          'User-Agent': 'Stellar-Donation-API/1.0',
+          'User-Agent': 'Stella-Donation-API/1.0',
           'X-Webhook-Signature': `sha256=${signature}`,
           ...correlationHeaders,
         },
+        // Explicitly enforce TLS verification regardless of NODE_TLS_REJECT_UNAUTHORIZED
+        rejectUnauthorized: !tlsSkipVerify,
         timeout: 10000,
       };
 
       const req = lib.request(options, (res) => {
         res.resume();
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve({ statusCode: res.statusCode });
-        } else {
-          reject(new Error(`HTTP ${res.statusCode}`));
-        }
+        const delivered = res.statusCode >= 200 && res.statusCode < 300;
+        resolve({ delivered, statusCode: res.statusCode });
       });
 
       req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out')); });

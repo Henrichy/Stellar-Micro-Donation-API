@@ -125,12 +125,14 @@ const requireApiKey = require('../middleware/apiKey');
 const { checkPermission } = require('../middleware/rbac');
 const { PERMISSIONS } = require('../utils/permissions');
 const { getStellarService } = require('../config/stellar');
+const asyncHandler = require('../utils/asyncHandler');
+const { payloadSizeLimiter, ENDPOINT_LIMITS } = require('../middleware/payloadSizeLimiter');
 
 /**
  * POST /liquidity-pools/deposit
  * Deposit assets into a Stellar AMM liquidity pool.
  */
-router.post('/deposit', requireApiKey, checkPermission(PERMISSIONS.DONATIONS_WRITE), async (req, res, next) => {
+router.post('/deposit', requireApiKey, checkPermission(PERMISSIONS.DONATIONS_WRITE), payloadSizeLimiter(ENDPOINT_LIMITS.default), asyncHandler(async (req, res, next) => {
   try {
     const { secret, assetA, assetB, maxAmountA, maxAmountB } = req.body;
 
@@ -148,13 +150,13 @@ router.post('/deposit', requireApiKey, checkPermission(PERMISSIONS.DONATIONS_WRI
   } catch (error) {
     next(error);
   }
-});
+}));
 
 /**
  * POST /liquidity-pools/withdraw
  * Withdraw assets from a Stellar AMM liquidity pool.
  */
-router.post('/withdraw', requireApiKey, checkPermission(PERMISSIONS.DONATIONS_WRITE), async (req, res, next) => {
+router.post('/withdraw', requireApiKey, checkPermission(PERMISSIONS.DONATIONS_WRITE), payloadSizeLimiter(ENDPOINT_LIMITS.default), asyncHandler(async (req, res, next) => {
   try {
     const { secret, poolId, amount } = req.body;
 
@@ -172,13 +174,13 @@ router.post('/withdraw', requireApiKey, checkPermission(PERMISSIONS.DONATIONS_WR
   } catch (error) {
     next(error);
   }
-});
+}));
 
 /**
  * GET /liquidity-pools/:id/earnings
  * Get earnings for a specific liquidity pool.
  */
-router.get('/:id/earnings', requireApiKey, checkPermission(PERMISSIONS.STATS_READ), async (req, res, next) => {
+router.get('/:id/earnings', requireApiKey, checkPermission(PERMISSIONS.STATS_READ), asyncHandler(async (req, res, next) => {
   try {
     const { id } = req.params;
     const stellarService = getStellarService();
@@ -187,6 +189,6 @@ router.get('/:id/earnings', requireApiKey, checkPermission(PERMISSIONS.STATS_REA
   } catch (error) {
     next(error);
   }
-});
+}));
 
 module.exports = router;

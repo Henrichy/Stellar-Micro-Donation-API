@@ -16,7 +16,10 @@ const { validateApiKey } = require('../models/apiKeys');
 const config = require('../config');
 const AuditLogService = require('../services/AuditLogService');
 const perKeyRateLimit = require('./perKeyRateLimit');
+const { checkRateLimit, buildRateLimitHeaders, DEFAULT_RATE_LIMIT, DEFAULT_WINDOW_SECONDS } = require('./perKeyRateLimit');
+const crypto = require('crypto');
 const { tierMeetsMinimum } = require('../config/permissionMatrix');
+const { verifyAccessToken } = require('../services/JwtService');
 
 /**
  * Role-Based Access Control (RBAC) Configuration
@@ -318,7 +321,7 @@ exports.requireAdmin = () => {
  * 6. Context Injection: Populates req.user with a standardized identity object for downstream use.
  */
 exports.attachUserRole = () => {
-  return async (req, res, next) => {
+  return (req, res, next) => {
     try {
       // Priority 1: Bearer JWT from Authorization header
       if (req.headers && typeof req.headers.authorization === 'string' && req.headers.authorization.startsWith('Bearer ')) {
@@ -362,57 +365,99 @@ exports.attachUserRole = () => {
         };
         return next();
       }
-      // Priority 3: x-api-key header lookup
+      // Priority 3: x-api-key header lookup (async, non-blocking)
       else if (req.headers && req.headers['x-api-key']) {
         const apiKey = req.headers['x-api-key'];
-        const keyInfo = await validateApiKey(apiKey);
+        
+        // Validate API key asynchronously without blocking the request
+        validateApiKey(apiKey).then((keyInfo) => {
+          if (keyInfo) {
+            req.apiKey = keyInfo;
+            req.user = {
+              id: `apikey-${keyInfo.id}`,
+              role: keyInfo.role || 'user',
+              name: keyInfo.name || `API Key User (${keyInfo.role || 'user'})`,
+              apiKeyId: keyInfo.id,
+              scopes: keyInfo.scopes || [],
+              isLegacy: false
+            };
 
-        if (keyInfo) {
-          req.apiKey = keyInfo;
-          req.user = {
-            id: `apikey-${keyInfo.id}`,
-            role: keyInfo.role || 'user',
-            name: keyInfo.name || `API Key User (${keyInfo.role || 'user'})`,
-            apiKeyId: keyInfo.id,
-            scopes: keyInfo.scopes || [],
-            isLegacy: false
-          };
+            // Graceful handling for keys slated for rotation
+            if (keyInfo.isDeprecated) {
+              res.setHeader('X-API-Key-Deprecated', 'true');
+              res.setHeader('Warning', '299 - "API key is deprecated and will be revoked soon"');
+            }
 
-          // Graceful handling for keys slated for rotation
-          if (keyInfo.isDeprecated) {
-            res.setHeader('X-API-Key-Deprecated', 'true');
-            res.setHeader('Warning', '299 - "API key is deprecated and will be revoked soon"');
-          }
-
-          // Suggest rotation when key age exceeds 80% of its grace period
-          if (!keyInfo.isDeprecated && keyInfo.createdAt && keyInfo.gracePeriodDays) {
-            const ageMs = Date.now() - keyInfo.createdAt;
-            const thresholdMs = keyInfo.gracePeriodDays * 0.8 * 24 * 60 * 60 * 1000;
-            if (ageMs >= thresholdMs) {
-              res.setHeader('X-Rotation-Suggested', 'true');
+            // Suggest rotation when key age exceeds 80% of its grace period
+            if (!keyInfo.isDeprecated && keyInfo.createdAt && keyInfo.gracePeriodDays) {
+              const ageMs = Date.now() - keyInfo.createdAt;
+              const thresholdMs = keyInfo.gracePeriodDays * 0.8 * 24 * 60 * 60 * 1000;
+              if (ageMs >= thresholdMs) {
+                res.setHeader('X-Rotation-Suggested', 'true');
+              }
             }
           }
-        }
-        // Priority 3: Legacy Environment variable support
-        else if (legacyKeys.includes(apiKey)) {
-          req.user = {
-            id: `apikey-${apiKey}`,
-            role: apiKey.startsWith('admin-') ? 'admin' : 'user',
-            name: 'Legacy API Key User',
-            scopes: [],
-            isLegacy: true
-          };
-        }
-        // Failure: No valid key found
-        else {
-          return res.status(401).json({
-            success: false,
-            error: {
-              code: 'UNAUTHORIZED',
-              message: 'Invalid or expired API key.'
+          // Priority 3: Legacy Environment variable support
+          else if (legacyKeys.includes(apiKey)) {
+            // Derive a stable, non-reversible ID for rate-limiting without storing the raw key
+            const legacyKeyId = 'legacy-' + crypto.createHash('sha256').update(apiKey).digest('hex').slice(0, 16);
+
+            // Apply the same default rate limit as DB-backed keys
+            const rlResult = checkRateLimit(legacyKeyId, DEFAULT_RATE_LIMIT, DEFAULT_WINDOW_SECONDS);
+            const rlHeaders = buildRateLimitHeaders(rlResult.limit, rlResult.remaining, rlResult.resetAt);
+            res.set(rlHeaders);
+            res.set('X-API-Key-Legacy', 'true');
+            res.set('Warning', '299 - "Legacy API key in use. Migrate to database-backed keys before 2026-12-31. See docs/MIGRATION_LEGACY_API_KEYS.md"');
+
+            if (!rlResult.allowed) {
+              res.set('Retry-After', String(Math.ceil((rlResult.resetAt - Date.now()) / 1000)));
+              return res.status(429).json({
+                success: false,
+                error: {
+                  code: 'RATE_LIMIT_EXCEEDED',
+                  message: 'Rate limit exceeded. Please retry after the reset time.',
+                  retryAfter: Math.ceil((rlResult.resetAt - Date.now()) / 1000),
+                },
+              });
             }
-          });
-        }
+
+            req.user = {
+              id: legacyKeyId,
+              role: apiKey.startsWith('admin-') ? 'admin' : 'user',
+              name: 'Legacy API Key User',
+              scopes: [],
+              isLegacy: true
+            };
+
+            // Audit every legacy key usage
+            AuditLogService.log({
+              category: AuditLogService.CATEGORY.AUTHENTICATION,
+              action: AuditLogService.ACTION.LEGACY_KEY_USED,
+              severity: AuditLogService.SEVERITY.HIGH,
+              result: 'SUCCESS',
+              userId: legacyKeyId,
+              requestId: req.id,
+              ipAddress: req.ip,
+              resource: req.path,
+              details: {
+                method: req.method,
+                keyIdHash: legacyKeyId,
+                sunsetDate: '2026-12-31',
+              },
+            }).catch(() => {});
+          }
+          // Default: Unauthenticated Guest access
+          else {
+            req.user = { id: 'guest', role: 'guest', name: 'Guest', scopes: [] };
+          }
+          next();
+        }).catch((err) => {
+          // On error, default to guest access
+          log.warn('RBAC', 'Failed to validate API key, defaulting to guest', { error: err.message });
+          req.user = { id: 'guest', role: 'guest', name: 'Guest', scopes: [] };
+          next();
+        });
+        return;
       }
       // Default: Unauthenticated Guest access
       else {

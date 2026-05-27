@@ -120,6 +120,11 @@ class SseManager {
     }
     return true;
   }
+  /** Reset all state — for use in tests only. */
+  _reset() {
+    this.stop();
+    this._clients = new Map();
+  }
 }
 
 module.exports = new SseManager();

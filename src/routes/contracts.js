@@ -8,6 +8,8 @@ const { getStellarService } = require('../config/stellar');
 const requireApiKey = require('../middleware/apiKey');
 const { requireAdmin } = require('../middleware/rbac');
 const AuditLogService = require('../services/AuditLogService');
+const asyncHandler = require('../utils/asyncHandler');
+const { payloadSizeLimiter, ENDPOINT_LIMITS } = require('../middleware/payloadSizeLimiter');
 
 const router = express.Router();
 
@@ -22,7 +24,7 @@ const router = express.Router();
  *   400 { success: false, error: { code: "VALIDATION_ERROR", message: string } }
  *   500 { success: false, error: { code: "INVOKE_FAILED", message: string } }
  */
-router.post('/:contractId/invoke', requireApiKey, requireAdmin(), async (req, res) => {
+router.post('/:contractId/invoke', requireApiKey, requireAdmin(), payloadSizeLimiter(ENDPOINT_LIMITS.admin), asyncHandler(async (req, res) => {
   const { contractId } = req.params;
   const { method, args = [], sourceSecret } = req.body;
 
@@ -62,7 +64,7 @@ router.post('/:contractId/invoke', requireApiKey, requireAdmin(), async (req, re
       error: { code: 'INVOKE_FAILED', message: err.message },
     });
   }
-});
+}));
 
 /**
  * POST /contracts/:contractId/simulate
@@ -75,7 +77,7 @@ router.post('/:contractId/invoke', requireApiKey, requireAdmin(), async (req, re
  *   400 { success: false, error: { code: "VALIDATION_ERROR", message: string } }
  *   500 { success: false, error: { code: "SIMULATE_FAILED", message: string } }
  */
-router.post('/:contractId/simulate', requireApiKey, requireAdmin(), async (req, res) => {
+router.post('/:contractId/simulate', requireApiKey, requireAdmin(), payloadSizeLimiter(ENDPOINT_LIMITS.admin), asyncHandler(async (req, res) => {
   const { contractId } = req.params;
   const { method, args = [] } = req.body;
 
@@ -102,7 +104,7 @@ router.post('/:contractId/simulate', requireApiKey, requireAdmin(), async (req, 
       error: { code: 'SIMULATE_FAILED', message: err.message },
     });
   }
-});
+}));
 
 /**
  * GET /contracts/:contractId/state
@@ -113,7 +115,7 @@ router.post('/:contractId/simulate', requireApiKey, requireAdmin(), async (req, 
  *   200 { success: true, data: Array<{ key, value }>, count: number }
  *   500 { success: false, error: { code: "FETCH_STATE_FAILED", message: string } }
  */
-router.get('/:contractId/state', requireApiKey, requireAdmin(), async (req, res) => {
+router.get('/:contractId/state', requireApiKey, requireAdmin(), asyncHandler(async (req, res) => {
   try {
     const stellarService = getStellarService();
     const data = await stellarService.getContractState(req.params.contractId);
@@ -124,7 +126,7 @@ router.get('/:contractId/state', requireApiKey, requireAdmin(), async (req, res)
       error: { code: 'FETCH_STATE_FAILED', message: err.message },
     });
   }
-});
+}));
 
 /**
  * GET /contracts/:id/events
@@ -138,7 +140,7 @@ router.get('/:contractId/state', requireApiKey, requireAdmin(), async (req, res)
  *   400 { success: false, error: { code: "INVALID_REQUEST", message: string } }
  *   500 { success: false, error: { code: "FETCH_EVENTS_FAILED", message: string } }
  */
-router.get('/:id/events', async (req, res) => {
+router.get('/:id/events', asyncHandler(async (req, res) => {
   let limit;
 
   if (req.query.limit !== undefined) {
@@ -168,6 +170,6 @@ router.get('/:id/events', async (req, res) => {
       },
     });
   }
-});
+}));
 
 module.exports = router;

@@ -22,6 +22,7 @@ const crypto = require('crypto');
 const MAX_AGE = {
   wallet: 30,
   campaign: 60,
+  'campaign-progress': 30,
   stats: 120,
   'exchange-rate': 300,
   default: 60,

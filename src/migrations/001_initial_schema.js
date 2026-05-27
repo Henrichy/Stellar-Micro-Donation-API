@@ -75,6 +75,11 @@ exports.up = async (db) => {
       nextExecutionDate DATETIME NOT NULL,
       status TEXT DEFAULT 'active',
       executionCount INTEGER DEFAULT 0,
+      customIntervalDays INTEGER DEFAULT NULL,
+      maxExecutions INTEGER DEFAULT NULL,
+      webhookUrl TEXT DEFAULT NULL,
+      failureCount INTEGER DEFAULT 0,
+      lastExecutionDate DATETIME DEFAULT NULL,
       tenant_id TEXT NOT NULL DEFAULT 'default',
       FOREIGN KEY (donorId) REFERENCES users(id),
       FOREIGN KEY (recipientId) REFERENCES users(id)
@@ -107,4 +112,14 @@ exports.up = async (db) => {
       FOREIGN KEY (feeId) REFERENCES student_fees(id)
     )
   `);
+};
+
+exports.down = async (db) => {
+  await db.run('DROP TABLE IF EXISTS fee_payments');
+  await db.run('DROP TABLE IF EXISTS student_fees');
+  await db.run('DROP INDEX IF EXISTS idx_transactions_idempotency');
+  await db.run('DROP TABLE IF EXISTS recurring_donations');
+  await db.run('DROP TABLE IF EXISTS transactions');
+  await db.run('DROP TABLE IF EXISTS campaigns');
+  await db.run('DROP TABLE IF EXISTS users');
 };

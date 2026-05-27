@@ -48,6 +48,7 @@ const ERROR_CODES = {
   // Business logic errors (5000-5099)
   INSUFFICIENT_BALANCE: { code: 'INSUFFICIENT_BALANCE', numeric: 5000 },
   TRANSACTION_FAILED:   { code: 'TRANSACTION_FAILED',   numeric: 5001 },
+  INVALID_STATE_TRANSITION: { code: 'INVALID_STATE_TRANSITION', numeric: 5015 },
   FEE_BUMP_MAX_ATTEMPTS:  { code: 'FEE_BUMP_MAX_ATTEMPTS',  numeric: 5010 },
   FEE_BUMP_EXCEEDS_CAP:   { code: 'FEE_BUMP_EXCEEDS_CAP',   numeric: 5011 },
   FEE_BUMP_INVALID_STATE: { code: 'FEE_BUMP_INVALID_STATE', numeric: 5012 },
@@ -232,5 +233,26 @@ module.exports = {
   BusinessLogicError,
   InternalError,
   DatabaseError,
-  DuplicateError
+  DuplicateError,
+  ConflictError,
+  /**
+   * Build a standard error response body.
+   * Use this for inline res.status().json() calls to ensure consistent format.
+   *
+   * @param {string} code - Error code string (e.g. 'INVALID_PUBLIC_KEY')
+   * @param {string} message - Human-readable error message
+   * @param {string} [requestId] - Request ID from req.id
+   * @returns {{ success: false, error: { code, message, requestId, timestamp } }}
+   */
+  formatError(code, message, requestId) {
+    return {
+      success: false,
+      error: {
+        code,
+        message,
+        ...(requestId && { requestId }),
+        timestamp: new Date().toISOString(),
+      },
+    };
+  },
 };

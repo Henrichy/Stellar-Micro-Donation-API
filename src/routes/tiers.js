@@ -22,6 +22,8 @@ const { PERMISSIONS } = require('../utils/permissions');
 const SubscriptionTierService = require('../services/SubscriptionTierService');
 const serviceContainer = require('../config/serviceContainer');
 const AuditLogService = require('../services/AuditLogService');
+const asyncHandler = require('../utils/asyncHandler');
+const { payloadSizeLimiter, ENDPOINT_LIMITS } = require('../middleware/payloadSizeLimiter');
 
 /** Lazy singleton — avoids circular-require issues at module load time */
 function getTierService() {
@@ -42,7 +44,7 @@ function getTierService() {
  * @body {string} [interval]        - daily | weekly | monthly (default: monthly)
  * @body {string|Object} [benefits] - Free-form benefits description
  */
-router.post('/', checkPermission(PERMISSIONS.ADMIN_ALL), async (req, res, next) => {
+router.post('/', checkPermission(PERMISSIONS.ADMIN_ALL), payloadSizeLimiter(ENDPOINT_LIMITS.admin), asyncHandler(async (req, res, next) => {
   try {
     const { name, amount, interval, benefits } = req.body;
     const tier = await getTierService().createTier({ name, amount, interval, benefits });
@@ -63,25 +65,59 @@ router.post('/', checkPermission(PERMISSIONS.ADMIN_ALL), async (req, res, next) 
   } catch (err) {
     next(err);
   }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /tiers
+// GET /tiers  — public, rate-limited, CDN-cacheable (#793)
 // ─────────────────────────────────────────────────────────────────────────────
+
+let rateLimit;
+try { rateLimit = require('express-rate-limit'); } catch (_) { rateLimit = () => (_req, _res, next) => next(); }
+
+/** 30 req/min per IP — prevents scraping while allowing normal browsing */
+const tiersPublicRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: false,
+  message: { success: false, error: { code: 'RATE_LIMIT_EXCEEDED', message: 'Too many requests. Please try again later.' } },
+});
+
+/**
+ * Strip internal fields from a tier row before sending to unauthenticated clients.
+ * Removes: id, stripe_plan_id, internal_feature_flags, discount_rules, created_at, updated_at
+ */
+function sanitizeTierForPublic(tier) {
+  const { name, amount, interval, benefits } = tier;
+  let parsedBenefits = benefits;
+  if (typeof benefits === 'string') {
+    try { parsedBenefits = JSON.parse(benefits); } catch (_) { /* keep as string */ }
+  }
+  return { name, amount, interval, benefits: parsedBenefits };
+}
 
 /**
  * @route   GET /tiers
- * @desc    List all subscription tiers
- * @access  donations:read
+ * @desc    List all subscription tiers — public, no auth required
+ * @access  Public (rate-limited to 30 req/min per IP)
  */
-router.get('/', checkPermission(PERMISSIONS.DONATIONS_READ), async (req, res, next) => {
+router.get('/', tiersPublicRateLimit, asyncHandler(async (req, res, next) => {
   try {
     const tiers = await getTierService().listTiers();
-    res.json({ success: true, data: tiers, count: tiers.length });
+    const publicTiers = tiers.map(sanitizeTierForPublic);
+
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.json({
+      success: true,
+      data: publicTiers,
+      count: publicTiers.length,
+      lastUpdatedAt: new Date().toISOString(),
+    });
   } catch (err) {
     next(err);
   }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /tiers/analytics
@@ -92,7 +128,7 @@ router.get('/', checkPermission(PERMISSIONS.DONATIONS_READ), async (req, res, ne
  * @desc    Tier analytics: subscriber counts and revenue per tier
  * @access  stats:admin
  */
-router.get('/analytics', checkPermission(PERMISSIONS.STATS_ADMIN), async (req, res, next) => {
+router.get('/analytics', checkPermission(PERMISSIONS.STATS_ADMIN), asyncHandler(async (req, res, next) => {
   try {
     const analytics = await getTierService().getTierAnalytics();
 
@@ -112,7 +148,7 @@ router.get('/analytics', checkPermission(PERMISSIONS.STATS_ADMIN), async (req, r
   } catch (err) {
     next(err);
   }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /tiers/:id/subscribe
@@ -128,7 +164,7 @@ router.get('/analytics', checkPermission(PERMISSIONS.STATS_ADMIN), async (req, r
  * @body  {string} recipientPublicKey    - Recipient's Stellar public key
  * @body  {string} [startDate]           - ISO date for first execution
  */
-router.post('/:id/subscribe', checkPermission(PERMISSIONS.STREAM_CREATE), async (req, res, next) => {
+router.post('/:id/subscribe', checkPermission(PERMISSIONS.STREAM_CREATE), payloadSizeLimiter(ENDPOINT_LIMITS.admin), asyncHandler(async (req, res, next) => {
   try {
     const tierId = parseInt(req.params.id, 10);
     if (!Number.isInteger(tierId) || tierId < 1) {
@@ -171,7 +207,7 @@ router.post('/:id/subscribe', checkPermission(PERMISSIONS.STREAM_CREATE), async 
   } catch (err) {
     next(err);
   }
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DELETE /tiers/subscriptions/:subId
@@ -182,7 +218,7 @@ router.post('/:id/subscribe', checkPermission(PERMISSIONS.STREAM_CREATE), async 
  * @desc    Cancel a donor subscription (also cancels the recurring donation)
  * @access  stream:delete
  */
-router.delete('/subscriptions/:subId', checkPermission(PERMISSIONS.STREAM_DELETE), async (req, res, next) => {
+router.delete('/subscriptions/:subId', checkPermission(PERMISSIONS.STREAM_DELETE), asyncHandler(async (req, res, next) => {
   try {
     const subId = parseInt(req.params.subId, 10);
     if (!Number.isInteger(subId) || subId < 1) {
@@ -207,7 +243,7 @@ router.delete('/subscriptions/:subId', checkPermission(PERMISSIONS.STREAM_DELETE
   } catch (err) {
     next(err);
   }
-});
+}));
 
 module.exports = router;
 

@@ -147,7 +147,7 @@ async function ensureTotpColumns() {
     try {
       await db.run(sql);
     } catch (err) {
-      const msg = (err.details && err.details.originalError) || err.message || '';
+      const msg = (err.details && err.details.originalError) || err.originalError?.message || err.message || '';
       if (!msg.includes('duplicate column')) throw err;
     }
   }

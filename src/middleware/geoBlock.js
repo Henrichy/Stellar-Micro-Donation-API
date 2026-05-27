@@ -253,13 +253,16 @@ class GeoBlockMiddleware {
    * @param {Object} res - Express response object
    * @param {Function} next - Express next function
    */
-  async middleware(req, res, next) {
-    // Wait for initialization if not ready
-    if (!this.initialized) {
-      await this.initPromise;
+  middleware(req, res, next) {
+    // Initialize asynchronously without blocking the request
+    if (!this.initialized && this.initPromise) {
+      this.initPromise.catch((err) => {
+        log.warn('GEO_BLOCK', 'Initialization failed, geo-blocking disabled', { error: err.message });
+      });
     }
 
-    const databaseRules = await this.ruleService.loadRules();
+    // Use cached rules to avoid blocking on database queries
+    const databaseRules = this.ruleService.getCachedRules();
     const ruleState = this.buildRuleState(databaseRules);
 
     // Skip if geo-blocking is not configured
@@ -276,7 +279,7 @@ class GeoBlockMiddleware {
     const decision = this.shouldBlock(clientIP, ruleState);
 
     if (decision.block) {
-      // Log blocked request
+      // Log blocked request (non-blocking)
       log.warn('GEO_BLOCK', 'Request blocked by geo-blocking', {
         ip: clientIP,
         country: decision.countryCode,
@@ -287,7 +290,8 @@ class GeoBlockMiddleware {
         matchedRule: decision.matchedRule
       });
 
-      await this.auditLogService.log({
+      // Audit log asynchronously without blocking the response
+      this.auditLogService.log({
         category: this.auditLogService.CATEGORY.AUTHORIZATION,
         action: 'GEO_REQUEST_BLOCKED',
         severity: this.auditLogService.SEVERITY.MEDIUM,
@@ -304,6 +308,8 @@ class GeoBlockMiddleware {
           path: req.path,
           userAgent: req.get('User-Agent'),
         }
+      }).catch((err) => {
+        log.error('GEO_BLOCK', 'Failed to log blocked request', { error: err.message });
       });
 
       // Return 403 with custom header

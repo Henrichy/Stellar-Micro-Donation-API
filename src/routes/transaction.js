@@ -133,7 +133,7 @@
 
 const express = require('express');
 const router = express.Router();
-const Transaction = require('../models/transaction');
+const Transaction = require('./models/transaction');
 const TransactionSyncService = require('../services/TransactionSyncService');
 const MultiSigService = require('../services/MultiSigService');
 const { buildErrorResponse } = require('../utils/validationErrorFormatter');
@@ -141,9 +141,10 @@ const sseManager = require('../services/SseManager');
 const serviceContainer = require('../config/serviceContainer');
 const { checkPermission } = require('../middleware/rbac');
 const { PERMISSIONS } = require('../utils/permissions');
-const { payloadSizeLimiter } = require('../middleware/payloadSizeLimiter');
-const { ENDPOINT_LIMITS } = require('../constants');
+const { payloadSizeLimiter, ENDPOINT_LIMITS } = require('../middleware/payloadSizeLimiter');
 const { validateSchema } = require('../middleware/schemaValidation');
+const asyncHandler = require('../utils/asyncHandler');
+const { validateDateRange } = require('../middleware/validation');
 
 const multiSigService = new MultiSigService(serviceContainer.getStellarService());
 
@@ -168,6 +169,34 @@ const transactionListQuerySchema = validateSchema({
           return parsed >= 0 ? true : 'offset must be a non-negative integer';
         },
       },
+      cursor: {
+        type: 'string',
+        required: false,
+        // Accept both legacy "timestamp_id" and new base64-JSON cursors (contain "=", "+", "/")
+        validate: (value) => {
+          // Base64-JSON cursors are produced when date filters are active
+          const isBase64 = /^[A-Za-z0-9+/]+=*$/.test(value);
+          if (isBase64) return true;
+          // Legacy format: timestamp_id
+          if (!value.includes('_')) {
+            return 'cursor must be in format: timestamp_id';
+          }
+          const [timestamp] = value.split('_');
+          const parsed = parseInt(timestamp);
+          return !isNaN(parsed) ? true : 'cursor timestamp must be a valid integer';
+        },
+      },
+      startDate: {
+        type: 'string',
+        required: false,
+        // Date format/range validation is handled by validateDateRange middleware
+        // which returns INVALID_DATE_FORMAT (1004) and INVALID_DATE_RANGE codes
+      },
+      endDate: {
+        type: 'string',
+        required: false,
+        // Date format/range validation is handled by validateDateRange middleware
+      },
     },
   },
 });
@@ -182,51 +211,124 @@ const transactionSyncBodySchema = validateSchema({
         minLength: 1,
         maxLength: 255,
       },
+      cursor: {
+        type: 'string',
+        required: false,
+        trim: true,
+      },
+      maxPages: {
+        type: 'integer',
+        required: false,
+        validate: (value) => {
+          const n = Number(value);
+          return n >= 1 && n <= 500 ? true : 'maxPages must be between 1 and 500';
+        },
+      },
     },
   },
 });
 
-router.get('/', checkPermission(PERMISSIONS.TRANSACTIONS_READ), transactionListQuerySchema, async (req, res, next) => {
+/**
+ * Map a transaction record to include stellarTxHash for blockchain verification (#776).
+ * stellarTxHash is a 64-char hex string when present, or null for pending transactions.
+ */
+function withStellarTxHash(tx) {
+  return {
+    ...tx,
+    stellarTxHash: tx.stellarTxId || null,
+  };
+}
+
+router.get('/', checkPermission(PERMISSIONS.TRANSACTIONS_READ), transactionListQuerySchema, validateDateRange, asyncHandler(async (req, res, next) => {
   try {
-    const { limit = 10, offset = 0 } = req.query;
+    const { limit = 20, offset, cursor, startDate, endDate } = req.query;
 
-    
-    if (isNaN(limit) || limit <= 0) {
-      return res.status(400).json(
-        buildErrorResponse([{ code: 'INVALID_LIMIT', receivedValue: req.query.limit }])
-      );
+    // Cursor-based pagination (preferred)
+    if (cursor !== undefined) {
+      const result = Transaction.getCursorPaginated({
+        limit: parseInt(limit),
+        cursor: cursor || null,
+        startDate: startDate || undefined,
+        endDate: endDate || undefined,
+      });
+
+      return res.status(200).json({
+        success: true,
+        data: result.data.map(withStellarTxHash),
+        pagination: {
+          limit: parseInt(limit),
+          nextCursor: result.nextCursor,
+          hasMore: result.hasMore,
+          ...(startDate && { startDate }),
+          ...(endDate && { endDate }),
+        },
+      });
     }
 
-    if (isNaN(offset) || offset < 0) {
-      return res.status(400).json(
-        buildErrorResponse([{ code: 'INVALID_OFFSET', receivedValue: req.query.offset }])
-      );
+    // Offset-based pagination (deprecated)
+    if (offset !== undefined) {
+      const offsetNum = parseInt(offset);
+      const limitNum = parseInt(limit);
+
+      if (isNaN(limitNum) || limitNum <= 0) {
+        return res.status(400).json(
+          buildErrorResponse([{ code: 'INVALID_LIMIT', receivedValue: req.query.limit }])
+        );
+      }
+
+      if (isNaN(offsetNum) || offsetNum < 0) {
+        return res.status(400).json(
+          buildErrorResponse([{ code: 'INVALID_OFFSET', receivedValue: req.query.offset }])
+        );
+      }
+
+      const result = Transaction.getPaginated({
+        limit: limitNum,
+        offset: offsetNum,
+      });
+
+      // Add deprecation warning header
+      res.setHeader('X-Pagination-Deprecated', 'Offset-based pagination is deprecated. Use cursor-based pagination with ?cursor= parameter.');
+
+      return res.status(200).json({
+        success: true,
+        data: result.data.map(withStellarTxHash),
+        pagination: result.pagination,
+      });
     }
 
-    const result = Transaction.getPaginated({
-      limit: paginationValidation.limit,
-      offset: paginationValidation.offset
+    // Default: cursor-based pagination (no cursor supplied, optional date filters)
+    const result = Transaction.getCursorPaginated({
+      limit: parseInt(limit),
+      startDate: startDate || undefined,
+      endDate: endDate || undefined,
     });
 
     return res.status(200).json({
       success: true,
-      data: result.data,
-      pagination: result.pagination
+      data: result.data.map(withStellarTxHash),
+      pagination: {
+        limit: parseInt(limit),
+        nextCursor: result.nextCursor,
+        hasMore: result.hasMore,
+        ...(startDate && { startDate }),
+        ...(endDate && { endDate }),
+      },
     });
 
   } catch (error) {
     next(error);
   }
-});
+}));
 
 router.post(
   "/sync",
   payloadSizeLimiter(ENDPOINT_LIMITS.transaction),
   checkPermission(PERMISSIONS.TRANSACTIONS_SYNC),
   transactionSyncBodySchema,
-  async (req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     try {
-      const { publicKey } = req.body;
+      const { publicKey, cursor, maxPages } = req.body;
 
       if (!publicKey) {
         return res.status(400).json(
@@ -235,7 +337,10 @@ router.post(
       }
 
       const syncService = new TransactionSyncService(serviceContainer.getStellarService());
-      const result = await syncService.syncWalletTransactions(publicKey);
+      const result = await syncService.syncWalletTransactions(publicKey, {
+        ...(cursor !== undefined && { cursor }),
+        ...(maxPages !== undefined && { maxPages: Number(maxPages) }),
+      });
 
       return res.status(200).json({
         success: true,
@@ -244,7 +349,7 @@ router.post(
     } catch (error) {
       next(error);
     }
-  },
+  })
 );
 
 
@@ -257,7 +362,7 @@ router.post(
 router.post(
   '/multisig',
   checkPermission(PERMISSIONS.TRANSACTIONS_SYNC),
-  async (req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     try {
       const { transaction_xdr, network_passphrase, required_signers, signer_keys, metadata } = req.body;
       const tx = await multiSigService.createMultiSigTransaction({
@@ -271,7 +376,7 @@ router.post(
     } catch (err) {
       next(err);
     }
-  }
+  })
 );
 
 /**
@@ -283,7 +388,7 @@ router.post(
 router.post(
   '/multisig/collect',
   checkPermission(PERMISSIONS.TRANSACTIONS_SYNC),
-  async (req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     try {
       const { id, signer, signed_xdr } = req.body;
 
@@ -321,7 +426,7 @@ router.post(
     } catch (err) {
       next(err);
     }
-  }
+  })
 );
 
 /**
@@ -332,7 +437,7 @@ router.post(
 router.post(
   '/:id/sign',
   checkPermission(PERMISSIONS.TRANSACTIONS_SYNC),
-  async (req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     try {
       const id = parseInt(req.params.id, 10);
       if (isNaN(id)) {
@@ -344,7 +449,7 @@ router.post(
     } catch (err) {
       next(err);
     }
-  }
+  })
 );
 
 /**
@@ -354,7 +459,7 @@ router.post(
 router.get(
   '/:id/signatures',
   checkPermission(PERMISSIONS.TRANSACTIONS_READ),
-  async (req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     try {
       const id = parseInt(req.params.id, 10);
       if (isNaN(id)) {
@@ -365,7 +470,7 @@ router.get(
     } catch (err) {
       next(err);
     }
-  }
+  })
 );
 
 // ─── Transaction Simulation Endpoint ─────────────────────────────────────────
@@ -382,7 +487,7 @@ router.post(
   '/simulate',
   payloadSizeLimiter(ENDPOINT_LIMITS.transaction),
   checkPermission(PERMISSIONS.TRANSACTIONS_SIMULATE),
-  async (req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     try {
       const { tx_envelope } = req.body;
 
@@ -421,7 +526,7 @@ router.post(
       }
       next(err);
     }
-  }
+  })
 );
 
 // ─── Memo Decryption Endpoint ────────────────────────────────────────────────
@@ -458,7 +563,7 @@ router.post(
       },
     },
   }),
-  async (req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     try {
       const { id } = req.params;
       const { recipientSecret } = req.body;
@@ -515,7 +620,7 @@ router.post(
     } catch (error) {
       next(error);
     }
-  }
+  })
 );
 
 /**
@@ -527,7 +632,7 @@ router.post(
 router.get(
   '/:id/envelope',
   checkPermission(PERMISSIONS.TRANSACTIONS_READ),
-  async (req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     try {
       const { id } = req.params;
       const tx = Transaction.getById(id);
@@ -563,7 +668,7 @@ router.get(
     } catch (error) {
       next(error);
     }
-  }
+  })
 );
 
 /**
@@ -600,6 +705,30 @@ router.get('/stream', (req, res) => {
   // Send initial connection event
   res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
 });
+
+/**
+ * GET /transactions/:id
+ * Get a single transaction by ID, including stellarTxHash for blockchain verification (#776).
+ * Must be declared after all specific named routes to avoid shadowing them.
+ */
+router.get(
+  '/:id',
+  checkPermission(PERMISSIONS.TRANSACTIONS_READ),
+  asyncHandler(async (req, res, next) => {
+    try {
+      const tx = Transaction.getById(req.params.id);
+      if (!tx) {
+        return res.status(404).json({
+          success: false,
+          error: { code: 'TRANSACTION_NOT_FOUND', message: `Transaction ${req.params.id} not found` },
+        });
+      }
+      return res.status(200).json({ success: true, data: withStellarTxHash(tx) });
+    } catch (error) {
+      next(error);
+    }
+  })
+);
 
 module.exports = router;
 module.exports.sseManager = sseManager;

@@ -13,6 +13,8 @@ const requireApiKey = require('../../middleware/apiKey');
 const { requireAdmin } = require('../../middleware/rbac');
 const { validateSchema } = require('../../middleware/schemaValidation');
 const log = require('../../utils/log');
+const asyncHandler = require('../../utils/asyncHandler');
+const { payloadSizeLimiter, ENDPOINT_LIMITS } = require('../../middleware/payloadSizeLimiter');
 
 const createImpactMetricSchema = validateSchema({
   body: {
@@ -29,7 +31,7 @@ const createImpactMetricSchema = validateSchema({
  * POST /admin/impact-metrics
  * Create a new impact metric for a campaign.
  */
-router.post('/', requireApiKey, requireAdmin(), createImpactMetricSchema, async (req, res, next) => {
+router.post('/', requireApiKey, requireAdmin(), createImpactMetricSchema, payloadSizeLimiter(ENDPOINT_LIMITS.admin), asyncHandler(async (req, res, next) => {
   try {
     const { campaign_id, unit, amount_per_unit, description } = req.body;
 
@@ -45,13 +47,13 @@ router.post('/', requireApiKey, requireAdmin(), createImpactMetricSchema, async 
   } catch (error) {
     next(error);
   }
-});
+}));
 
 /**
  * GET /admin/impact-metrics
  * List impact metrics, optionally filtered by campaign_id.
  */
-router.get('/', requireApiKey, requireAdmin(), async (req, res, next) => {
+router.get('/', requireApiKey, requireAdmin(), asyncHandler(async (req, res, next) => {
   try {
     const { campaign_id } = req.query;
 
@@ -67,19 +69,19 @@ router.get('/', requireApiKey, requireAdmin(), async (req, res, next) => {
   } catch (error) {
     next(error);
   }
-});
+}));
 
 /**
  * GET /admin/impact-metrics/:id
  * Get a specific impact metric by ID.
  */
-router.get('/:id', requireApiKey, requireAdmin(), async (req, res, next) => {
+router.get('/:id', requireApiKey, requireAdmin(), asyncHandler(async (req, res, next) => {
   try {
     const metric = await ImpactMetricService.getById(parseInt(req.params.id, 10));
     res.json({ success: true, data: metric });
   } catch (error) {
     next(error);
   }
-});
+}));
 
 module.exports = router;

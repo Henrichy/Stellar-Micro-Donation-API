@@ -31,6 +31,16 @@ const options = {
           type: 'apiKey',
           in: 'header',
           name: 'x-api-key',
+          description: 'API key passed in the x-api-key header. Obtain via `npm run keys:create`.',
+        },
+      },
+      headers: {
+        XRequestID: {
+          description:
+            'Unique identifier for the request. Include this in support requests to correlate client activity with server logs. ' +
+            'If you supply a valid UUID v4 in the `X-Request-ID` request header the server echoes it back; ' +
+            'otherwise the server generates one automatically.',
+          schema: { type: 'string', format: 'uuid', example: '550e8400-e29b-41d4-a716-446655440000' },
         },
       },
       schemas: {
@@ -41,9 +51,97 @@ const options = {
             error: {
               type: 'object',
               properties: {
-                message: { type: 'string' },
-                code: { type: 'string' },
+                message: { type: 'string', example: 'Validation failed' },
+                code: { type: 'string', example: 'VALIDATION_ERROR' },
               },
+            },
+          },
+        },
+        ValidationError: {
+          allOf: [
+            { $ref: '#/components/schemas/Error' },
+            {
+              type: 'object',
+              properties: {
+                error: {
+                  type: 'object',
+                  properties: {
+                    code: { type: 'string', example: 'VALIDATION_ERROR' },
+                    message: { type: 'string', example: 'Invalid request parameters' },
+                    details: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          field: { type: 'string' },
+                          message: { type: 'string' },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          ],
+        },
+        UnauthorizedError: {
+          type: 'object',
+          properties: {
+            success: { type: 'boolean', example: false },
+            error: {
+              type: 'object',
+              properties: {
+                code: { type: 'string', example: 'UNAUTHORIZED' },
+                message: { type: 'string', example: 'Invalid or missing API key' },
+              },
+            },
+          },
+        },
+        NotFoundError: {
+          type: 'object',
+          properties: {
+            success: { type: 'boolean', example: false },
+            error: {
+              type: 'object',
+              properties: {
+                code: { type: 'string', example: 'NOT_FOUND' },
+                message: { type: 'string', example: 'Resource not found' },
+              },
+            },
+          },
+        },
+        PaginationMeta: {
+          type: 'object',
+          properties: {
+            limit: { type: 'integer', example: 20 },
+            direction: { type: 'string', enum: ['next', 'prev'], example: 'next' },
+            next_cursor: { type: 'string', nullable: true, example: 'eyJ0aW1lc3RhbXAiOiIyMDI0LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJpZCI6IjEifQ==' },
+            prev_cursor: { type: 'string', nullable: true, example: null },
+          },
+        },
+      },
+      responses: {
+        Unauthorized: {
+          description: 'Missing or invalid API key',
+          content: {
+            'application/json': {
+              schema: { $ref: '#/components/schemas/UnauthorizedError' },
+            },
+          },
+        },
+        NotFound: {
+          description: 'Resource not found',
+          content: {
+            'application/json': {
+              schema: { $ref: '#/components/schemas/NotFoundError' },
+            },
+          },
+        },
+        ValidationError: {
+          description: 'Validation error',
+          content: {
+            'application/json': {
+              schema: { $ref: '#/components/schemas/ValidationError' },
             },
           },
         },

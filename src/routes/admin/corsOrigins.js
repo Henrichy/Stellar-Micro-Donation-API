@@ -17,6 +17,8 @@ const express = require('express');
 const router = express.Router();
 const Database = require('../../utils/database');
 const requireApiKey = require('../../middleware/apiKey');
+const asyncHandler = require('../../utils/asyncHandler');
+const { payloadSizeLimiter, ENDPOINT_LIMITS } = require('../../middleware/payloadSizeLimiter');
 const { requireAdmin } = require('../../middleware/rbac');
 const { invalidateCache } = require('../../middleware/cors');
 
@@ -24,7 +26,7 @@ const { invalidateCache } = require('../../middleware/cors');
  * GET /admin/cors/origins
  * List all allowed origins in the database allowlist.
  */
-router.get('/', requireApiKey, requireAdmin(), async (req, res, next) => {
+router.get('/', requireApiKey, requireAdmin(), asyncHandler(async (req, res, next) => {
   try {
     const rows = await Database.query(
       'SELECT id, origin, allowCredentials, createdAt, createdBy FROM cors_origins ORDER BY id ASC',
@@ -34,7 +36,7 @@ router.get('/', requireApiKey, requireAdmin(), async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * POST /admin/cors/origins
@@ -43,7 +45,7 @@ router.get('/', requireApiKey, requireAdmin(), async (req, res, next) => {
  * @body {string} origin            - Origin URL or wildcard pattern (e.g. https://example.com or *.example.com)
  * @body {boolean} [allowCredentials=true] - Whether to allow credentials for this origin
  */
-router.post('/', requireApiKey, requireAdmin(), async (req, res, next) => {
+router.post('/', requireApiKey, requireAdmin(), payloadSizeLimiter(ENDPOINT_LIMITS.admin), asyncHandler(async (req, res, next) => {
   try {
     const { origin, allowCredentials = true } = req.body;
 
@@ -96,13 +98,13 @@ router.post('/', requireApiKey, requireAdmin(), async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * DELETE /admin/cors/origins/:id
  * Remove an allowed origin from the database allowlist.
  */
-router.delete('/:id', requireApiKey, requireAdmin(), async (req, res, next) => {
+router.delete('/:id', requireApiKey, requireAdmin(), asyncHandler(async (req, res, next) => {
   try {
     const { id } = req.params;
     const existing = await Database.get('SELECT id FROM cors_origins WHERE id = ?', [id]);
@@ -120,6 +122,6 @@ router.delete('/:id', requireApiKey, requireAdmin(), async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+}));
 
 module.exports = router;

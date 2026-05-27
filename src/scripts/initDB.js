@@ -10,6 +10,9 @@ function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     console.log(`✓ Created data directory: ${DATA_DIR}`);
+    // Issue #890: Set restrictive permissions on data directory (owner only)
+    fs.chmodSync(DATA_DIR, 0o700);
+    console.log(`✓ Set data directory permissions to 0700 (owner only)`);
   }
 }
 
@@ -20,6 +23,13 @@ function createDatabase() {
         reject(err);
       } else {
         console.log(`✓ Connected to SQLite database: ${DB_PATH}`);
+        // Issue #890: Set restrictive permissions on database file (owner only)
+        try {
+          fs.chmodSync(DB_PATH, 0o600);
+          console.log(`✓ Set database file permissions to 0600 (owner only)`);
+        } catch (chmodErr) {
+          console.warn(`⚠ Could not set database file permissions: ${chmodErr.message}`);
+        }
         resolve(db);
       }
     });
@@ -140,6 +150,41 @@ function createCampaignsTable(db) {
   });
 }
 
+function createRecurringDonationsTable(db) {
+  return new Promise((resolve, reject) => {
+    const createTableSQL = `
+      CREATE TABLE IF NOT EXISTS recurring_donations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        donorId INTEGER NOT NULL,
+        recipientId INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        frequency TEXT NOT NULL,
+        nextExecutionDate DATETIME NOT NULL,
+        status TEXT DEFAULT 'active',
+        executionCount INTEGER DEFAULT 0,
+        customIntervalDays INTEGER DEFAULT NULL,
+        maxExecutions INTEGER DEFAULT NULL,
+        webhookUrl TEXT DEFAULT NULL,
+        failureCount INTEGER DEFAULT 0,
+        lastExecutionDate DATETIME DEFAULT NULL,
+        deleted_at DATETIME DEFAULT NULL,
+        tenant_id TEXT NOT NULL DEFAULT 'default',
+        FOREIGN KEY (donorId) REFERENCES users(id),
+        FOREIGN KEY (recipientId) REFERENCES users(id)
+      )
+    `;
+
+    db.run(createTableSQL, (err) => {
+      if (err) {
+        reject(err);
+      } else {
+        console.log('✓ Created recurring_donations table (with all required columns)');
+        resolve();
+      }
+    });
+  });
+}
+
 function createStudentFeeTables(db) {
   return new Promise((resolve, reject) => {
     db.serialize(() => {
@@ -186,6 +231,7 @@ async function main() {
     await createTransactionsTable(db);
     await createIndexes(db);
     await createCampaignsTable(db);
+    await createRecurringDonationsTable(db);
     await createStudentFeeTables(db);
     
     // Note: If you are running this on an existing DB, you will need to manually 
