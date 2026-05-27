@@ -403,24 +403,30 @@ app.get('/api/v1/health', healthCheckRateLimiter, healthHandler);
 
 app.get('/health', healthCheckRateLimiter, healthHandler);
 
-// Liveness probe — returns 200 as long as the process is running
-app.get('/health/live', healthCheckRateLimiter, (req, res) => {
+// Liveness probe — returns 200 as long as the process is running.
+// Excluded from rate limiting: Kubernetes calls this every few seconds per pod.
+app.get('/health/live', (req, res) => {
   return res.status(200).json(HealthCheckService.getLiveness());
 });
 
-// Readiness probe — returns 200 only when all dependencies are healthy
-app.get('/health/ready', healthCheckRateLimiter, asyncHandler(async (req, res) => {
+// Readiness probe — returns 200 only when all dependencies are healthy.
+// Excluded from rate limiting: Kubernetes calls this every few seconds per pod.
+app.get('/health/ready', asyncHandler(async (req, res) => {
+  if (isShuttingDown) {
+    return res.status(503).json({ status: 'not_ready', reason: 'server is shutting down' });
+  }
   try {
     const readiness = await HealthCheckService.getReadiness(stellarService, networkStatusService, recurringDonationScheduler);
-    const httpStatus = readiness.ready ? 200 : 503;
-    return res.status(httpStatus).json(readiness);
+    if (readiness.ready) {
+      return res.status(200).json({ status: 'ready', timestamp: readiness.timestamp });
+    }
+    const reason = readiness.status === 'unhealthy'
+      ? 'one or more critical dependencies are unavailable'
+      : `service is ${readiness.status}`;
+    return res.status(503).json({ status: 'not_ready', reason, timestamp: readiness.timestamp });
   } catch (err) {
     log.error('HEALTH', 'Readiness check failed', { error: err.message });
-    return res.status(503).json({
-      success: false,
-      ready: false,
-      error: { code: 'READINESS_CHECK_ERROR', message: 'Readiness check failed' }
-    });
+    return res.status(503).json({ status: 'not_ready', reason: 'readiness check failed' });
   }
 }));
 
@@ -722,6 +728,9 @@ async function startServer() {
         await WebhookService.WebhookService.initTable();
         await validateRBAC();
 
+        // Start audit log auto-flush timer
+        AuditLogService.startAutoFlush();
+
         // Only start background workers and jobs if not in test environment
         if (process.env.NODE_ENV !== 'test') {
           const stopQuotaResetJob = startQuotaResetJob();
@@ -869,6 +878,15 @@ async function startServer() {
           log.info("SHUTDOWN", "SQLite WAL checkpoint completed");
         } catch (err) {
           log.warn("SHUTDOWN", "Error checkpointing WAL", { error: err.message });
+        }
+
+        // Flush pending audit log entries before closing the database
+        try {
+          await AuditLogService.flush();
+          AuditLogService.stopAutoFlush();
+          log.info("SHUTDOWN", "Audit log buffer flushed");
+        } catch (err) {
+          log.error("SHUTDOWN", "Error flushing audit log buffer", { error: err.message });
         }
 
         await Database.close();
