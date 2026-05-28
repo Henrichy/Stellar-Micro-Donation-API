@@ -686,90 +686,108 @@ router.post('/:id/home-domain/verify', checkPermission(PERMISSIONS.WALLETS_READ)
 
 /**
  * GET /wallets/:publicKey/transactions
- * Get all transactions (sent and received) for a wallet with pagination
+ * Get all transactions (sent and received) for a wallet with cursor-based pagination.
  * Query params:
  *   - limit: number of results per page (default 20, max 100)
- *   - cursor: pagination cursor (transaction ID to start after)
+ *   - cursor: opaque base64-encoded pagination cursor (transaction ID)
  */
 router.get('/:publicKey/transactions', checkPermission(PERMISSIONS.WALLETS_READ), walletPublicKeySchema, asyncHandler(async (req, res, next) => {
   try {
     const { publicKey } = req.params;
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
-    const cursor = req.query.cursor ? parseInt(req.query.cursor, 10) : null;
 
-    // First, check if user exists with this publicKey
+    // Validate limit
+    const rawLimit = req.query.limit;
+    let limit = 20;
+    if (rawLimit !== undefined) {
+      const parsed = parseInt(rawLimit, 10);
+      if (!Number.isFinite(parsed) || parsed < 1 || parsed > 100) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_LIMIT', message: 'limit must be an integer between 1 and 100' },
+        });
+      }
+      limit = parsed;
+    }
+
+    // Decode opaque cursor (base64-encoded numeric ID)
+    let cursorId = null;
+    if (req.query.cursor) {
+      try {
+        const decoded = Buffer.from(req.query.cursor, 'base64').toString('utf8');
+        const parsed = parseInt(decoded, 10);
+        if (!Number.isFinite(parsed)) throw new Error('invalid');
+        cursorId = parsed;
+      } catch {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_CURSOR', message: 'Invalid cursor parameter' },
+        });
+      }
+    }
+
+    // Check wallet exists
     const user = await Database.get(
-      'SELECT id, publicKey, createdAt FROM users WHERE publicKey = ? AND deleted_at IS NULL',
+      'SELECT id, publicKey, createdAt FROM users WHERE publicKey = ?',
       [publicKey]
     );
 
     if (!user) {
-      // Return 404 if wallet doesn't exist or is soft-deleted
       return res.status(404).json({ error: 'Wallet not found' });
     }
 
-    // Get total count
+    // Total count
     const countResult = await Database.get(
-      `SELECT COUNT(*) as total
-      FROM transactions t
-      WHERE t.senderId = ? OR t.receiverId = ?`,
+      'SELECT COUNT(*) as total FROM transactions t WHERE t.senderId = ? OR t.receiverId = ?',
       [user.id, user.id]
     );
     const total = countResult.total;
 
-    // Build query with cursor-based pagination
+    // Fetch limit+1 to detect hasMore
+    const params = [user.id, user.id];
     let query = `SELECT
-        t.id,
-        t.senderId,
-        t.receiverId,
-        t.amount,
-        t.memo,
-        t.timestamp,
+        t.id, t.senderId, t.receiverId, t.amount, t.memo, t.timestamp,
         sender.publicKey as senderPublicKey,
         receiver.publicKey as receiverPublicKey
       FROM transactions t
       LEFT JOIN users sender ON t.senderId = sender.id
       LEFT JOIN users receiver ON t.receiverId = receiver.id
       WHERE (t.senderId = ? OR t.receiverId = ?)`;
-    
-    const params = [user.id, user.id];
 
-    // Add cursor condition if provided
-    if (cursor) {
-      query += ` AND t.id > ?`;
-      params.push(cursor);
+    if (cursorId !== null) {
+      query += ' AND t.id > ?';
+      params.push(cursorId);
     }
 
-    query += ` ORDER BY t.id ASC LIMIT ?`;
-    params.push(limit);
+    query += ' ORDER BY t.id ASC LIMIT ?';
+    params.push(limit + 1);
 
-    // Get transactions
-    const transactions = await Database.query(query, params);
+    const rows = await Database.query(query, params);
+    const hasMore = rows.length > limit;
+    const transactions = hasMore ? rows.slice(0, limit) : rows;
 
-    // Format the response — convert stored stroops back to XLM for output
     const formattedTransactions = transactions.map(tx => ({
       id: tx.id,
       sender: tx.senderPublicKey,
       receiver: tx.receiverPublicKey,
       amount: (tx.amount / STROOPS_PER_XLM).toFixed(7),
       memo: tx.memo,
-      timestamp: tx.timestamp
+      timestamp: tx.timestamp,
     }));
 
-    // Calculate next cursor
-    const nextCursor = transactions.length === limit && transactions.length > 0
-      ? transactions[transactions.length - 1].id
+    // Encode next cursor as opaque base64 string
+    const lastTx = transactions[transactions.length - 1];
+    const nextCursor = hasMore && lastTx
+      ? Buffer.from(String(lastTx.id)).toString('base64')
       : null;
 
     res.json({
       success: true,
       data: formattedTransactions,
-      count: formattedTransactions.length,
-      total,
       pagination: {
-        limit,
-        nextCursor
-      }
+        nextCursor,
+        hasMore,
+        total,
+      },
     });
   } catch (error) {
     next(error);
