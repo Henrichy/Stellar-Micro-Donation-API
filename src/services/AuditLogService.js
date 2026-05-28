@@ -64,6 +64,7 @@ const AUDIT_ACTION = {
   API_KEY_LISTED: 'API_KEY_LISTED',
   API_KEY_DEPRECATED: 'API_KEY_DEPRECATED',
   API_KEY_REVOKED: 'API_KEY_REVOKED',
+  API_KEY_EXTENDED: 'API_KEY_EXTENDED',
   
   // Financial Operations
   DONATION_CREATED: 'DONATION_CREATED',
@@ -264,10 +265,6 @@ class AuditLogService {
   static async log(params) {
     auditLogMetrics.totalAttempts += 1;
     try {
-      if (process.env.NODE_ENV === 'test') {
-        return { success: true, skipped: true };
-      }
-
       if (!tableInitialized) {
         if (tableInitPromise) {
           await tableInitPromise;
@@ -321,10 +318,6 @@ class AuditLogService {
     resource = null,
     reason = null
   }) {
-    if (process.env.NODE_ENV === 'test') {
-      return { id: 'test-log-id', category, action, severity, result };
-    }
-
     try {
       // Validate required fields
       if (!category || !action || !severity || !result) {

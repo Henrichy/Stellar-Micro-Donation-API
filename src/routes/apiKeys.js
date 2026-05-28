@@ -349,6 +349,88 @@ router.patch('/:id', requireAdmin(), apiKeyIdParamSchema, payloadSizeLimiter(END
 }));
 
 /**
+ * POST /api/v1/api-keys/:id/extend
+ * Extend an API key's expiration by a given number of days (admin only).
+ * Extension is applied from the current expiresAt, not from today.
+ * Maximum 365 days per request. Revoked keys cannot be extended.
+ */
+const apiKeyExtendSchema = validateSchema({
+  body: {
+    fields: {
+      days: { type: 'integer', required: true, min: 1 },
+    },
+  },
+});
+
+router.post('/:id/extend', requireAdmin(), apiKeyIdParamSchema, apiKeyExtendSchema, payloadSizeLimiter(ENDPOINT_LIMITS.admin), asyncHandler(async (req, res, next) => {
+  try {
+    const keyIdValidation = validateInteger(req.params.id, { min: 1 });
+    if (!keyIdValidation.valid) {
+      throw new ValidationError(`Invalid key ID: ${keyIdValidation.error}`);
+    }
+
+    const { days } = req.body;
+    if (days > 365) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'EXTENSION_TOO_LONG', message: 'Maximum extension is 365 days per request' },
+      });
+    }
+
+    let result;
+    try {
+      result = await apiKeysModel.extendApiKey(keyIdValidation.value, days);
+    } catch (err) {
+      if (err.code === 'KEY_REVOKED') {
+        return res.status(409).json({
+          success: false,
+          error: { code: 'KEY_REVOKED', message: 'Cannot extend a revoked key' },
+        });
+      }
+      throw err;
+    }
+
+    if (!result) {
+      return res.status(404).json({
+        success: false,
+        error: { code: 'NOT_FOUND', message: 'API key not found' },
+      });
+    }
+
+    await AuditLogService.log({
+      category: AuditLogService.CATEGORY.API_KEY_MANAGEMENT,
+      action: AuditLogService.ACTION.API_KEY_EXTENDED,
+      severity: AuditLogService.SEVERITY.HIGH,
+      result: 'SUCCESS',
+      userId: req.user.id,
+      requestId: req.id,
+      ipAddress: req.ip,
+      resource: `/api/v1/api-keys/${keyIdValidation.value}`,
+      details: {
+        keyId: keyIdValidation.value,
+        days,
+        oldExpiresAt: result.oldExpiresAt,
+        newExpiresAt: result.newExpiresAt,
+        extendedBy: req.user.id,
+      },
+    });
+    await AuditLogService.flush();
+
+    res.json({
+      success: true,
+      data: {
+        keyId: keyIdValidation.value,
+        days,
+        oldExpiresAt: result.oldExpiresAt,
+        newExpiresAt: result.newExpiresAt,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+}));
+
+/**
  * DELETE /api/v1/api-keys/:id
  * Revoke an API key (admin only)
  */
