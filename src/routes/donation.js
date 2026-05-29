@@ -1609,6 +1609,146 @@ router.get('/:id', checkPermission(PERMISSIONS.DONATIONS_READ), donationIdParamS
 });
 
 /**
+ * GET /donations/:id/timeline
+ * Get the complete lifecycle timeline of a donation
+ */
+router.get('/:id/timeline', checkPermission(PERMISSIONS.DONATIONS_READ), donationIdParamSchema, asyncHandler(async (req, res, next) => {
+  try {
+    const donationId = req.params.id;
+    const Database = require('../utils/database');
+
+    // Verify donation exists
+    const donation = donationService.getDonationById(donationId);
+    if (!donation) {
+      return res.status(404).json({
+        success: false,
+        error: { code: 'NOT_FOUND', message: 'Donation not found' }
+      });
+    }
+
+    const timeline = [];
+
+    // Event 1: Donation created
+    timeline.push({
+      timestamp: donation.timestamp,
+      event: 'created',
+      details: {
+        amount: donation.amount,
+        donor: donation.donor,
+        recipient: donation.recipient,
+        memo: donation.memo || null
+      }
+    });
+
+    // Event 2: Status changes from audit logs
+    try {
+      const auditLogs = await Database.query(
+        `SELECT * FROM audit_logs 
+         WHERE resource LIKE ? AND action LIKE 'DONATION_%' 
+         ORDER BY created_at ASC`,
+        [`%${donationId}%`]
+      );
+
+      for (const log of auditLogs) {
+        if (log.action === 'DONATION_SUBMITTED') {
+          timeline.push({
+            timestamp: log.created_at,
+            event: 'submitted',
+            details: log.details || {}
+          });
+        } else if (log.action === 'DONATION_CONFIRMED') {
+          timeline.push({
+            timestamp: log.created_at,
+            event: 'confirmed',
+            details: log.details || {}
+          });
+        } else if (log.action === 'DONATION_FAILED') {
+          timeline.push({
+            timestamp: log.created_at,
+            event: 'failed',
+            details: log.details || {}
+          });
+        } else if (log.action === 'DONATION_STATUS_CHANGED') {
+          timeline.push({
+            timestamp: log.created_at,
+            event: 'status_changed',
+            details: log.details || {}
+          });
+        }
+      }
+    } catch (err) {
+      // Audit logs table may not exist, continue
+    }
+
+    // Event 3: Refunds
+    try {
+      const refunds = await Database.query(
+        `SELECT * FROM refunds 
+         WHERE donation_id = ? 
+         ORDER BY created_at ASC`,
+        [donationId]
+      );
+
+      for (const refund of refunds) {
+        timeline.push({
+          timestamp: refund.created_at,
+          event: 'refunded',
+          details: {
+            refund_id: refund.id,
+            amount: refund.amount,
+            reason: refund.reason || null,
+            status: refund.status || 'pending'
+          }
+        });
+      }
+    } catch (err) {
+      // Refunds table may not exist, continue
+    }
+
+    // Event 4: Matching donations
+    try {
+      const matchingDonations = await Database.query(
+        `SELECT md.*, mp.sponsor_wallet_id 
+         FROM matching_donations md
+         JOIN matching_programs mp ON md.matching_program_id = mp.id
+         WHERE md.original_donation_id = ? 
+         ORDER BY md.created_at ASC`,
+        [donationId]
+      );
+
+      for (const match of matchingDonations) {
+        timeline.push({
+          timestamp: match.created_at,
+          event: 'matched',
+          details: {
+            matching_program_id: match.matching_program_id,
+            sponsor_wallet_id: match.sponsor_wallet_id,
+            matched_amount: match.matched_amount
+          }
+        });
+      }
+    } catch (err) {
+      // Matching donations table may not exist, continue
+    }
+
+    // Sort timeline by timestamp
+    timeline.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    // Mark processing complete
+    if (req.markLifecycleStage) {
+      req.markLifecycleStage(LIFECYCLE_STAGES.PROCESSED);
+    }
+
+    res.json({
+      success: true,
+      data: timeline
+    });
+  } catch (error) {
+    next(error);
+  }
+}));
+
+/**
  * PATCH /donations/:id/status
  * Update donation transaction status
  */

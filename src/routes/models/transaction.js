@@ -119,31 +119,37 @@ class Transaction {
   }
 
   /**
-   * Get paginated transactions using cursor-based pagination with optional date filtering.
+   * Get paginated transactions using cursor-based pagination with optional date filtering and sender/recipient filtering.
    *
    * When startDate or endDate are provided the results are filtered to only
    * include transactions whose timestamp falls within the specified range.
-   * The date range is encoded in the cursor so subsequent pages automatically
+   * When senderPublicKey or recipientPublicKey are provided, results are filtered
+   * to only include transactions matching those participants.
+   * The date range and filters are encoded in the cursor so subsequent pages automatically
    * apply the same filter without the caller needing to repeat the parameters.
    *
    * Cursor format (no date filter):  "<epochMs>_<id>"
-   * Cursor format (with date filter): base64(JSON { t, id, sd?, ed? })
+   * Cursor format (with date filter): base64(JSON { t, id, sd?, ed?, spk?, rpk? })
    *
    * @param {Object}  options
    * @param {number}  [options.limit=20]    - Items per page (max 100)
    * @param {string}  [options.cursor=null] - Opaque pagination cursor
    * @param {string}  [options.startDate]   - ISO 8601 start of date range (inclusive)
    * @param {string}  [options.endDate]     - ISO 8601 end of date range (inclusive)
+   * @param {string}  [options.senderPublicKey]   - Filter by sender public key
+   * @param {string}  [options.recipientPublicKey] - Filter by recipient public key
    * @returns {{ data: Array, nextCursor: string|null, hasMore: boolean }}
    */
-  static getCursorPaginated({ limit = 20, cursor = null, startDate, endDate } = {}) {
+  static getCursorPaginated({ limit = 20, cursor = null, startDate, endDate, senderPublicKey, recipientPublicKey } = {}) {
     const transactions = this.loadTransactions();
 
-    // Decode cursor — may carry embedded date range
+    // Decode cursor — may carry embedded date range and filters
     let cursorTime = null;
     let cursorId = null;
     let effectiveStartDate = startDate;
     let effectiveEndDate = endDate;
+    let effectiveSenderPublicKey = senderPublicKey;
+    let effectiveRecipientPublicKey = recipientPublicKey;
 
     if (cursor) {
       // Try new base64-JSON format first (used when date filters are active)
@@ -155,6 +161,8 @@ class Transaction {
           // Restore encoded date range so it applies on every page
           if (decoded.sd) effectiveStartDate = decoded.sd;
           if (decoded.ed) effectiveEndDate = decoded.ed;
+          if (decoded.spk) effectiveSenderPublicKey = decoded.spk;
+          if (decoded.rpk) effectiveRecipientPublicKey = decoded.rpk;
         }
       } catch {
         // Fall back to legacy "timestamp_id" format
@@ -177,6 +185,14 @@ class Transaction {
     if (effectiveEndDate) {
       const end = new Date(effectiveEndDate).getTime();
       active = active.filter(t => new Date(t.timestamp).getTime() <= end);
+    }
+
+    // Apply sender/recipient filters
+    if (effectiveSenderPublicKey) {
+      active = active.filter(t => t.donor === effectiveSenderPublicKey);
+    }
+    if (effectiveRecipientPublicKey) {
+      active = active.filter(t => t.recipient === effectiveRecipientPublicKey);
     }
 
     // Sort by timestamp DESC, then by id DESC for consistent ordering
@@ -209,17 +225,19 @@ class Transaction {
     // Check if there are more results
     const hasMore = startIndex + pageLimit < sorted.length;
 
-    // Generate next cursor from the last item, embedding the date range when present
+    // Generate next cursor from the last item, embedding the date range and filters when present
     let nextCursor = null;
     if (hasMore && paginatedData.length > 0) {
       const lastItem = paginatedData[paginatedData.length - 1];
       const lastTimestamp = new Date(lastItem.timestamp).getTime();
 
-      if (effectiveStartDate || effectiveEndDate) {
-        // Encode date range into cursor so next page uses the same filter
+      if (effectiveStartDate || effectiveEndDate || effectiveSenderPublicKey || effectiveRecipientPublicKey) {
+        // Encode date range and filters into cursor so next page uses the same filter
         const cursorPayload = { t: lastTimestamp, id: lastItem.id };
         if (effectiveStartDate) cursorPayload.sd = effectiveStartDate;
         if (effectiveEndDate) cursorPayload.ed = effectiveEndDate;
+        if (effectiveSenderPublicKey) cursorPayload.spk = effectiveSenderPublicKey;
+        if (effectiveRecipientPublicKey) cursorPayload.rpk = effectiveRecipientPublicKey;
         nextCursor = Buffer.from(JSON.stringify(cursorPayload)).toString('base64');
       } else {
         nextCursor = `${lastTimestamp}_${lastItem.id}`;

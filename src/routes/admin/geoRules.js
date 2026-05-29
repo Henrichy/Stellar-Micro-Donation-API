@@ -211,6 +211,7 @@ router.delete('/:id', ...auth, async (req, res, next) => {
  * POST /admin/geo-rules/test
  * Test whether an IP address would be blocked under current rules.
  * Body: { ip: string }
+ * Returns: { allowed: boolean, country: string|null, countryName: string|null, matchedRule: Object|null, defaultAction: string }
  */
 router.post('/test', ...auth, async (req, res, next) => {
   try {
@@ -219,19 +220,236 @@ router.post('/test', ...auth, async (req, res, next) => {
       return respondError(res, 400, 'VALIDATION_ERROR', 'ip is required');
     }
 
+    // Validate IP format (basic check)
+    const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
+    if (!ipRegex.test(ip)) {
+      return respondError(res, 400, 'INVALID_IP_FORMAT', 'ip must be a valid IPv4 address');
+    }
+
+    // Check if it's a private/reserved IP
+    const isPrivateIP = this.isPrivateIP(ip);
+    if (isPrivateIP) {
+      return respondSuccess(res, {
+        allowed: true,
+        country: null,
+        countryName: null,
+        matchedRule: null,
+        defaultAction: 'allow'
+      });
+    }
+
     const databaseRules = await GeoRuleService.loadRules();
     const ruleState = geoBlockMiddleware.buildRuleState(databaseRules);
-    const country = geoBlockMiddleware.getCountryCode(ip) || null;
+    const countryCode = geoBlockMiddleware.getCountryCode(ip);
     const decision = geoBlockMiddleware.shouldBlock(ip, ruleState);
+
+    // Get country name from country code
+    const countryName = countryCode ? this.getCountryName(countryCode) : null;
+
+    // Determine matched rule details
+    let matchedRule = null;
+    if (decision.matchedRule) {
+      const rule = databaseRules.find(r => r.countryCode === decision.matchedRule.countryCode && r.ruleType === decision.matchedRule.type);
+      if (rule) {
+        matchedRule = {
+          id: rule.id,
+          action: rule.ruleType,
+          description: rule.description || null
+        };
+      }
+    }
 
     return respondSuccess(res, {
       allowed: !decision.block,
-      matchedRule: decision.matchedRule || null,
-      country,
+      country: countryCode,
+      countryName,
+      matchedRule,
+      defaultAction: 'allow'
     });
   } catch (err) {
     next(err);
   }
 });
 
-module.exports = router;
+/**
+ * Check if IP is private/reserved (RFC 1918)
+ * @param {string} ip - IP address
+ * @returns {boolean}
+ */
+function isPrivateIP(ip) {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some(p => p < 0 || p > 255)) {
+    return false;
+  }
+
+  const [a, b] = parts;
+  // 10.0.0.0/8
+  if (a === 10) return true;
+  // 172.16.0.0/12
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  // 192.168.0.0/16
+  if (a === 192 && b === 168) return true;
+  // 127.0.0.0/8 (loopback)
+  if (a === 127) return true;
+  // 169.254.0.0/16 (link-local)
+  if (a === 169 && b === 254) return true;
+
+  return false;
+}
+
+/**
+ * Get country name from ISO country code
+ * @param {string} countryCode - ISO 3166-1 alpha-2 code
+ * @returns {string|null}
+ */
+function getCountryName(countryCode) {
+  const countryNames = {
+    'US': 'United States',
+    'GB': 'United Kingdom',
+    'CA': 'Canada',
+    'AU': 'Australia',
+    'DE': 'Germany',
+    'FR': 'France',
+    'JP': 'Japan',
+    'CN': 'China',
+    'IN': 'India',
+    'BR': 'Brazil',
+    'RU': 'Russia',
+    'MX': 'Mexico',
+    'IT': 'Italy',
+    'ES': 'Spain',
+    'KR': 'South Korea',
+    'NL': 'Netherlands',
+    'SE': 'Sweden',
+    'CH': 'Switzerland',
+    'NO': 'Norway',
+    'DK': 'Denmark',
+    'FI': 'Finland',
+    'PL': 'Poland',
+    'TR': 'Turkey',
+    'SG': 'Singapore',
+    'HK': 'Hong Kong',
+    'NZ': 'New Zealand',
+    'ZA': 'South Africa',
+    'AE': 'United Arab Emirates',
+    'SA': 'Saudi Arabia',
+    'IL': 'Israel',
+    'TH': 'Thailand',
+    'MY': 'Malaysia',
+    'ID': 'Indonesia',
+    'PH': 'Philippines',
+    'VN': 'Vietnam',
+    'NG': 'Nigeria',
+    'EG': 'Egypt',
+    'KE': 'Kenya',
+    'AR': 'Argentina',
+    'CL': 'Chile',
+    'CO': 'Colombia',
+    'PE': 'Peru',
+    'UA': 'Ukraine',
+    'CZ': 'Czech Republic',
+    'GR': 'Greece',
+    'PT': 'Portugal',
+    'BE': 'Belgium',
+    'AT': 'Austria',
+    'IE': 'Ireland',
+    'HU': 'Hungary',
+    'RO': 'Romania',
+    'BG': 'Bulgaria',
+    'HR': 'Croatia',
+    'SI': 'Slovenia',
+    'SK': 'Slovakia',
+    'LT': 'Lithuania',
+    'LV': 'Latvia',
+    'EE': 'Estonia',
+    'IS': 'Iceland',
+    'LU': 'Luxembourg',
+    'MT': 'Malta',
+    'CY': 'Cyprus',
+    'GE': 'Georgia',
+    'KZ': 'Kazakhstan',
+    'UZ': 'Uzbekistan',
+    'TM': 'Turkmenistan',
+    'KG': 'Kyrgyzstan',
+    'TJ': 'Tajikistan',
+    'AF': 'Afghanistan',
+    'PK': 'Pakistan',
+    'BD': 'Bangladesh',
+    'LK': 'Sri Lanka',
+    'NP': 'Nepal',
+    'BT': 'Bhutan',
+    'MM': 'Myanmar',
+    'LA': 'Laos',
+    'KH': 'Cambodia',
+    'TW': 'Taiwan',
+    'MO': 'Macau',
+    'JO': 'Jordan',
+    'LB': 'Lebanon',
+    'SY': 'Syria',
+    'IQ': 'Iraq',
+    'IR': 'Iran',
+    'OM': 'Oman',
+    'QA': 'Qatar',
+    'BH': 'Bahrain',
+    'KW': 'Kuwait',
+    'YE': 'Yemen',
+    'PS': 'Palestine',
+    'LY': 'Libya',
+    'TN': 'Tunisia',
+    'DZ': 'Algeria',
+    'MA': 'Morocco',
+    'SD': 'Sudan',
+    'ET': 'Ethiopia',
+    'SO': 'Somalia',
+    'DJ': 'Djibouti',
+    'ER': 'Eritrea',
+    'UG': 'Uganda',
+    'TZ': 'Tanzania',
+    'RW': 'Rwanda',
+    'BW': 'Botswana',
+    'NA': 'Namibia',
+    'ZM': 'Zambia',
+    'ZW': 'Zimbabwe',
+    'MW': 'Malawi',
+    'MZ': 'Mozambique',
+    'AO': 'Angola',
+    'CG': 'Congo',
+    'CD': 'Democratic Republic of the Congo',
+    'GA': 'Gabon',
+    'CM': 'Cameroon',
+    'GH': 'Ghana',
+    'CI': 'Ivory Coast',
+    'SN': 'Senegal',
+    'ML': 'Mali',
+    'BF': 'Burkina Faso',
+    'NE': 'Niger',
+    'TD': 'Chad',
+    'CF': 'Central African Republic',
+    'BJ': 'Benin',
+    'TG': 'Togo',
+    'LR': 'Liberia',
+    'SL': 'Sierra Leone',
+    'GM': 'Gambia',
+    'GW': 'Guinea-Bissau',
+    'GN': 'Guinea',
+    'MR': 'Mauritania',
+    'CV': 'Cape Verde',
+    'SC': 'Seychelles',
+    'MU': 'Mauritius',
+    'MG': 'Madagascar',
+    'KM': 'Comoros',
+    'FJ': 'Fiji',
+    'PG': 'Papua New Guinea',
+    'SB': 'Solomon Islands',
+    'VU': 'Vanuatu',
+    'WS': 'Samoa',
+    'KI': 'Kiribati',
+    'TO': 'Tonga',
+    'PW': 'Palau',
+    'MH': 'Marshall Islands',
+    'FM': 'Micronesia',
+    'NR': 'Nauru',
+    'TV': 'Tuvalu',
+  };
+  return countryNames[countryCode] || null;
+}

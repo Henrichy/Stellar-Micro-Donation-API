@@ -197,6 +197,18 @@ const transactionListQuerySchema = validateSchema({
         required: false,
         // Date format/range validation is handled by validateDateRange middleware
       },
+      senderPublicKey: {
+        type: 'string',
+        required: false,
+        trim: true,
+        maxLength: 56,
+      },
+      recipientPublicKey: {
+        type: 'string',
+        required: false,
+        trim: true,
+        maxLength: 56,
+      },
     },
   },
 });
@@ -241,7 +253,7 @@ function withStellarTxHash(tx) {
 
 router.get('/', checkPermission(PERMISSIONS.TRANSACTIONS_READ), transactionListQuerySchema, validateDateRange, asyncHandler(async (req, res, next) => {
   try {
-    const { limit = 20, offset, cursor, startDate, endDate } = req.query;
+    const { limit = 20, offset, cursor, startDate, endDate, senderPublicKey, recipientPublicKey } = req.query;
 
     // Cursor-based pagination (preferred)
     if (cursor !== undefined) {
@@ -250,6 +262,8 @@ router.get('/', checkPermission(PERMISSIONS.TRANSACTIONS_READ), transactionListQ
         cursor: cursor || null,
         startDate: startDate || undefined,
         endDate: endDate || undefined,
+        senderPublicKey: senderPublicKey || undefined,
+        recipientPublicKey: recipientPublicKey || undefined,
       });
 
       return res.status(200).json({
@@ -261,6 +275,8 @@ router.get('/', checkPermission(PERMISSIONS.TRANSACTIONS_READ), transactionListQ
           hasMore: result.hasMore,
           ...(startDate && { startDate }),
           ...(endDate && { endDate }),
+          ...(senderPublicKey && { senderPublicKey }),
+          ...(recipientPublicKey && { recipientPublicKey }),
         },
       });
     }
@@ -302,6 +318,8 @@ router.get('/', checkPermission(PERMISSIONS.TRANSACTIONS_READ), transactionListQ
       limit: parseInt(limit),
       startDate: startDate || undefined,
       endDate: endDate || undefined,
+      senderPublicKey: senderPublicKey || undefined,
+      recipientPublicKey: recipientPublicKey || undefined,
     });
 
     return res.status(200).json({
@@ -313,6 +331,8 @@ router.get('/', checkPermission(PERMISSIONS.TRANSACTIONS_READ), transactionListQ
         hasMore: result.hasMore,
         ...(startDate && { startDate }),
         ...(endDate && { endDate }),
+        ...(senderPublicKey && { senderPublicKey }),
+        ...(recipientPublicKey && { recipientPublicKey }),
       },
     });
 
