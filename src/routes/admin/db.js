@@ -58,6 +58,26 @@ function parseLimit(rawLimit) {
 }
 
 /**
+ * Sanitize SQL by replacing parameter values with ? placeholders.
+ *
+ * @param {string} sql - SQL statement
+ * @param {Array} params - Query parameters
+ * @returns {string} Sanitized SQL
+ */
+function sanitizeSql(sql, params = []) {
+  if (!params || params.length === 0) {
+    return sql;
+  }
+
+  let sanitized = sql;
+  for (let i = 0; i < params.length; i++) {
+    // Replace first occurrence of ? with placeholder
+    sanitized = sanitized.replace('?', '?');
+  }
+  return sanitized;
+}
+
+/**
  * GET /admin/db/pool-status
  * Returns current connection pool metrics (issue #631).
  */
@@ -69,22 +89,93 @@ router.get('/pool-status', checkPermission(PERMISSIONS.ADMIN_ALL), (req, res) =>
 /**
  * GET /admin/db/slow-queries
  * Returns the slowest queries captured during the last 24 hours.
+ * Query params: limit (default 50, max 200), threshold (default SLOW_QUERY_WARN_MS)
  */
 router.get('/slow-queries', checkPermission(PERMISSIONS.ADMIN_ALL), (req, res, next) => {
   try {
-    const limit = parseLimit(req.query.limit);
-    const queries = Database.getSlowQueries({ limit });
+    const limit = Math.min(200, parseLimit(req.query.limit) || 50);
+    const threshold = parseLimit(req.query.threshold);
+    
+    let queries = Database.getSlowQueries({ limit });
+    
+    // Filter by threshold if provided
+    if (threshold !== undefined) {
+      queries = queries.filter(q => q.durationMs >= threshold);
+    }
+    
+    // Sanitize SQL statements
+    const sanitizedQueries = queries.map(q => ({
+      sql: sanitizeSql(q.sql, q.params),
+      durationMs: q.durationMs,
+      timestamp: q.isoTimestamp,
+      callerContext: q.method || 'unknown'
+    }));
+    
     const metrics = Database.getPerformanceMetrics();
 
     res.json({
       success: true,
       data: {
-        thresholdMs: metrics.thresholdMs,
+        thresholdMs: threshold !== undefined ? threshold : metrics.thresholdMs,
         averageQueryTimeMs: metrics.averageQueryTimeMs,
         recentQueryCount: metrics.recentQueryCount,
         slowQueryCount: metrics.slowQueryCount,
-        queries,
+        queries: sanitizedQueries,
       },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /admin/db/slow-queries/stats
+ * Returns aggregate statistics about slow queries.
+ */
+router.get('/slow-queries/stats', checkPermission(PERMISSIONS.ADMIN_ALL), (req, res, next) => {
+  try {
+    const queries = Database.getSlowQueries({ limit: 1000 });
+    const metrics = Database.getPerformanceMetrics();
+    
+    // Group queries by SQL pattern
+    const queryStats = {};
+    queries.forEach(q => {
+      const sanitized = sanitizeSql(q.sql, q.params);
+      if (!queryStats[sanitized]) {
+        queryStats[sanitized] = {
+          sql: sanitized,
+          count: 0,
+          totalDurationMs: 0,
+          minDurationMs: Infinity,
+          maxDurationMs: 0
+        };
+      }
+      queryStats[sanitized].count += 1;
+      queryStats[sanitized].totalDurationMs += q.durationMs;
+      queryStats[sanitized].minDurationMs = Math.min(queryStats[sanitized].minDurationMs, q.durationMs);
+      queryStats[sanitized].maxDurationMs = Math.max(queryStats[sanitized].maxDurationMs, q.durationMs);
+    });
+    
+    // Calculate averages and sort by count descending
+    const topQueries = Object.values(queryStats)
+      .map(stat => ({
+        sql: stat.sql,
+        count: stat.count,
+        avgDurationMs: Number((stat.totalDurationMs / stat.count).toFixed(2)),
+        minDurationMs: stat.minDurationMs,
+        maxDurationMs: stat.maxDurationMs
+      }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
+
+    res.json({
+      success: true,
+      data: {
+        totalSlowQueries24h: queries.length,
+        averageDurationMs: metrics.averageQueryTimeMs,
+        maxDurationMs: queries.length > 0 ? Math.max(...queries.map(q => q.durationMs)) : 0,
+        topQueries
+      }
     });
   } catch (error) {
     next(error);
