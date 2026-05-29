@@ -39,6 +39,7 @@ const systemInfoRoutes = require('./admin/systemInfo');
 const retentionAdminRoutes = require('./admin/retention');
 const retentionService = require('../services/RetentionService');
 const backupAdminRoutes = require('./admin/backup');
+const schedulerAdminRoutes = require('./admin/scheduler');
 const geoRulesAdminRoutes = require('./admin/geoRules');
 const encryptionAdminRoutes = require('./admin/encryption');
 const matchingProgramsAdminRoutes = require('./admin/matchingPrograms');
@@ -497,6 +498,9 @@ app.get('/suspicious-patterns', require('../middleware/rbac').requireAdmin(), (r
 
 // Data retention admin endpoints (admin only)
 app.use('/admin/retention', retentionAdminRoutes);
+
+// Scheduler admin endpoints (admin only)
+app.use('/admin/scheduler', schedulerAdminRoutes);
 
 // Disputes admin endpoints (admin only)
 app.use('/admin/disputes', disputesRoutes);

@@ -102,6 +102,66 @@ class RecurringDonationScheduler {
   }
 
   /**
+   * Pause the scheduler (stops executing ticks) without stopping the server process.
+   * @returns {void}
+   */
+  pause() {
+    if (!this.isRunning) return;
+    
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+
+    const { correlationId, traceId } = getCorrelationSummary();
+    log.info('RECURRING_SCHEDULER', 'Scheduler paused', { correlationId, traceId });
+  }
+
+  /**
+   * Resume a paused scheduler.
+   * @returns {void}
+   */
+  resume() {
+    if (!this.isRunning || this.intervalId) return;
+    
+    this.processSchedules();
+    this.intervalId = setInterval(() => this.processSchedules(), this.checkInterval);
+
+    const { correlationId, traceId } = getCorrelationSummary();
+    log.info('RECURRING_SCHEDULER', 'Scheduler resumed', { correlationId, traceId });
+  }
+
+  /**
+   * Check if the scheduler is paused.
+   * @returns {boolean}
+   */
+  isPaused() {
+    return this.isRunning && !this.intervalId;
+  }
+
+  /**
+   * Get detailed scheduler status.
+   * @returns {Object}
+   */
+  getDetailedStatus() {
+    const { correlationId, traceId } = getCorrelationSummary();
+    return {
+      isRunning: this.isRunning,
+      isPaused: this.isPaused(),
+      lastTickAt: this.lastTickAt,
+      lastTickDurationMs: this.lastTickDurationMs,
+      lastTickFailedSchedules: this.lastTickFailedSchedules,
+      activeScheduleCount: this.executingSchedules.size,
+      nextTickAt: this.isRunning && this.intervalId 
+        ? new Date(Date.now() + this.checkInterval).toISOString()
+        : null,
+      checkIntervalMs: this.checkInterval,
+      correlationId,
+      traceId,
+    };
+  }
+
+  /**
    * Stop the scheduler.
    * ntly executing donations.
    * @returns {void}
