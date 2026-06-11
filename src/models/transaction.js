@@ -11,7 +11,7 @@ const {
 
 class Transaction {
   static getDbPath() {
-    return process.env.DB_JSON_PATH || path.join(__dirname, '../../../data/donations.json');
+    return process.env.DB_JSON_PATH || path.join(__dirname, '../../data/donations.json');
   }
 
   static ensureDbDir() {

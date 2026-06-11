@@ -5,6 +5,33 @@ process.env.NODE_ENV = 'test';
 // Fixed test key — must be set before any module that imports securityConfig is loaded
 process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'test_encryption_key_fixed_32bytes_hex_value_here_00';
 
+// ─── Per-worker storage isolation ─────────────────────────────────────────────
+// Every Jest worker gets its own SQLite database (copied from the template
+// that globalSetup built) and its own JSON/key stores. Without this,
+// concurrent workers interleave reads and writes on the same files and
+// suites fail in bulk runs that pass in isolation. Must run before any
+// src/ module is required: the database layer resolves DB_PATH at load time.
+{
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  const isolationRoot = path.join(os.tmpdir(), 'stellar-test-isolation');
+  const workerDir = path.join(isolationRoot, `worker-${process.env.JEST_WORKER_ID || '1'}`);
+  fs.mkdirSync(workerDir, { recursive: true });
+
+  const workerDb = path.join(workerDir, 'stellar_donations.db');
+  const templateDb = path.join(isolationRoot, 'template.db');
+  if (!fs.existsSync(workerDb) && fs.existsSync(templateDb)) {
+    fs.copyFileSync(templateDb, workerDb);
+  }
+
+  process.env.DB_PATH = workerDb;
+  process.env.DB_JSON_PATH = path.join(workerDir, 'donations.json');
+  process.env.WALLETS_JSON_PATH = path.join(workerDir, 'wallets.json');
+  process.env.MEMO_KEYS_DIR = path.join(workerDir, 'memo-keys');
+}
+
 // ─── Reset shared in-memory singletons between test files ────────────────────
 // These modules use module-level state that persists across test files in the
 // same Jest worker. Resetting them here prevents cross-file contamination.

@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const WALLETS_DB_PATH = './data/wallets.json';
+const WALLETS_DB_PATH = process.env.WALLETS_JSON_PATH || './data/wallets.json';
 
 /** Encrypted field names on wallet records */
 const ENCRYPTED_FIELDS = ['label', 'notes'];
@@ -93,11 +93,12 @@ class Wallet {
   }
 
   /**
-   * Returns a specific wallet only if not soft-deleted
+   * Returns a specific wallet only if not soft-deleted.
+   * Ids are stored as strings (Date.now().toString()); accept numeric input.
    */
   static getById(id) {
     const wallets = this.loadWallets();
-    return decryptWalletFields(wallets.find(w => w.id === id && !w.deletedAt));
+    return decryptWalletFields(wallets.find(w => String(w.id) === String(id) && !w.deletedAt));
   }
 
   /**
@@ -118,7 +119,7 @@ class Wallet {
 
   static update(id, updates) {
     const wallets = this.loadWallets();
-    const index = wallets.findIndex(w => w.id === id && !w.deletedAt);
+    const index = wallets.findIndex(w => String(w.id) === String(id) && !w.deletedAt);
     if (index === -1) return null;
 
     wallets[index] = encryptWalletFields({
@@ -135,7 +136,7 @@ class Wallet {
    */
   static softDelete(id) {
     const wallets = this.loadWallets();
-    const index = wallets.findIndex(w => w.id === id);
+    const index = wallets.findIndex(w => String(w.id) === String(id));
     if (index === -1) return false;
 
     wallets[index].deletedAt = new Date().toISOString();
