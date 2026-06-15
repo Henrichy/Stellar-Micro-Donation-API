@@ -3,7 +3,7 @@
  * Tests path discovery, sorting, and execution
  */
 
-const { MockStellarService } = require('../../src/services/MockStellarService');
+const MockStellarService = require('../../src/services/MockStellarService');
 
 describe('Multi-Hop Path Payments', () => {
   let stellarService;
