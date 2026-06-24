@@ -35,14 +35,28 @@ function fileChecksum(filePath) {
 }
 
 function loadMigrationFiles() {
-  return fs
+  const files = fs
     .readdirSync(MIGRATIONS_DIR)
     .filter((f) => /^\d+.*\.js$/.test(f))
-    .sort()
-    .map((f) => {
-      const filePath = path.join(MIGRATIONS_DIR, f);
-      return { file: f, filePath, migration: require(filePath), checksum: fileChecksum(filePath) };
-    });
+    .sort();
+
+  // Detect duplicate numeric prefixes and fail fast so CI catches regressions.
+  const prefixMap = new Map();
+  for (const f of files) {
+    const prefix = f.match(/^(\d+)/)[1];
+    if (prefixMap.has(prefix)) {
+      throw new Error(
+        `Duplicate migration prefix "${prefix}": "${prefixMap.get(prefix)}" and "${f}". ` +
+        'Each migration must have a unique numeric prefix. Run `npm run migrate:check` for details.'
+      );
+    }
+    prefixMap.set(prefix, f);
+  }
+
+  return files.map((f) => {
+    const filePath = path.join(MIGRATIONS_DIR, f);
+    return { file: f, filePath, migration: require(filePath), checksum: fileChecksum(filePath) };
+  });
 }
 
 async function getApplied() {
