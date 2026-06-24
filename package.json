@@ -29,7 +29,7 @@
     "generate-key": "node src/scripts/generateKey.js",
     "validate:rbac": "node scripts/validate-rbac.js",
     "openapi:generate": "node scripts/generate-openapi.js",
-    "openapi:check": "node scripts/check-openapi-sync.js",
+    "openapi:check": "node scripts/check-openapi-sync.js && node scripts/verify-route-coverage.js",
     "test:load": "node tests/load/run-load-tests.js",
     "test:load:jest": "jest tests/implement-load-testing-suite.test.js --testTimeout=60000 --forceExit",
     "test:smoke": "jest --config jest.config.smoke.js --forceExit",
