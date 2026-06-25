@@ -15,6 +15,7 @@ const crypto = require('crypto');
 const { URL } = require('url');
 const log = require('../utils/log');
 const EncryptionService = require('./EncryptionService');
+const { assertSafeOutboundUrl } = require('../utils/ssrf');
 
 const MAX_RETRIES = 3;
 const MAX_CONSECUTIVE_FAILURES = 5;
@@ -122,6 +123,15 @@ class WebhookService {
     // tlsSkipVerify is not allowed in production
     if (tlsSkipVerify && process.env.NODE_ENV === 'production') {
       const e = new Error('tlsSkipVerify is not allowed in production'); e.status = 400; throw e;
+    }
+
+    // SSRF protection — validate host is not private/loopback/metadata
+    if (parsedUrl.protocol === 'https:') {
+      try {
+        await assertSafeOutboundUrl(url);
+      } catch (ssrfErr) {
+        const e = new Error(ssrfErr.message); e.status = 400; throw e;
+      }
     }
 
     // Always generate a 32-byte random secret server-side; never accept caller-supplied secrets
@@ -602,9 +612,11 @@ class WebhookService {
 
   /**
    * POST a JSON body to a URL with a timeout.
+   * Validates the URL against SSRF rules before every request (DNS rebinding protection).
    * @private
    */
-  static _httpPost(url, body, signature, correlationHeaders = {}, tlsSkipVerify = false) {
+  static async _httpPost(url, body, signature, correlationHeaders = {}, tlsSkipVerify = false) {
+    await assertSafeOutboundUrl(url);
     return new Promise((resolve, reject) => {
       const parsed = new URL(url);
       const lib = parsed.protocol === 'https:' ? https : http;
@@ -620,7 +632,6 @@ class WebhookService {
           'X-Webhook-Signature': `sha256=${signature}`,
           ...correlationHeaders,
         },
-        // Explicitly enforce TLS verification regardless of NODE_TLS_REJECT_UNAUTHORIZED
         rejectUnauthorized: !tlsSkipVerify,
         timeout: 10000,
       };
