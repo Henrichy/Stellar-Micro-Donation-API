@@ -22,6 +22,22 @@ const { serialize: csvSerialize } = require('../utils/csvSerializer');
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
+ * Escape CSV field to prevent formula injection.
+ * Prepends a single quote to fields starting with =, +, -, or @
+ * @param {string} field
+ * @returns {string}
+ */
+function escapeCsvFormula(field) {
+  if (!field) return '';
+  const str = String(field);
+  // Prevent formula injection by prepending ' to fields starting with formula chars
+  if (/^[=+\-@]/.test(str)) {
+    return "'" + str;
+  }
+  return str;
+}
+
+/**
  * Filter transactions by optional date range.
  * @param {Array} txs
  * @param {string} [startDate]
@@ -144,22 +160,13 @@ router.post('/report/export', requireApiKey, checkPermission(PERMISSIONS.DONATIO
     const totalAmount = txs.reduce((sum, tx) => sum + (parseFloat(tx.amount) || 0), 0);
 
     if (format === 'csv') {
-      const headers = ['SDG Code', 'Goal', 'Title', 'Total Amount (XLM)', 'Donation Count'];
-      const rows = [
-        ...breakdown.map(s => ({
-          'SDG Code': s.code,
-          'Goal': s.goal,
-          'Title': s.title,
-          'Total Amount (XLM)': s.totalAmount.toFixed(7),
-          'Donation Count': s.count,
-        })),
-        {
-          'SDG Code': 'Total',
-          'Goal': '',
-          'Title': 'All SDGs',
-          'Total Amount (XLM)': totalAmount.toFixed(7),
-          'Donation Count': txs.length,
-        },
+      const lines = [
+        'SDG Code,Goal,Title,Total Amount (XLM),Donation Count',
+        ...breakdown.map(s =>
+          `${escapeCsvFormula(s.code)},${escapeCsvFormula(s.goal)},"${escapeCsvFormula(s.title)}",${s.totalAmount.toFixed(7)},${s.count}`
+        ),
+        '',
+        `Total,,All SDGs,${totalAmount.toFixed(7)},${txs.length}`,
       ];
 
       res.setHeader('Content-Type', 'text/csv');

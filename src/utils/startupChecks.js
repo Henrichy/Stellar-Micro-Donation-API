@@ -35,18 +35,26 @@ function fail(name, detail) {
   console.error(`  ✖ ${name}${detail ? ': ' + detail : ''}`);
 }
 
-/** Check 1 — ENCRYPTION_KEY is set and has sufficient length */
+/** Check 1 — ENCRYPTION_KEY is set and exactly 64 hex characters (32 bytes) */
 function checkEncryptionKey() {
   const key = process.env.ENCRYPTION_KEY;
   if (!key || !key.trim()) {
-    fail('ENCRYPTION_KEY', 'not set — run `npm run generate-key` and add it to your .env file');
+    fail('ENCRYPTION_KEY', 'required but not set — run `npm run generate-key`');
     return false;
   }
-  if (key.length < 32) {
-    fail('ENCRYPTION_KEY', `too short (${key.length} chars, minimum 32)`);
+  const trimmedKey = key.trim();
+  
+  if (trimmedKey.length !== 64) {
+    fail('ENCRYPTION_KEY', `must be exactly 64 hex characters (32 bytes), got ${trimmedKey.length} — run `npm run generate-key``);
     return false;
   }
-  pass('ENCRYPTION_KEY', 'set and valid');
+  
+  if (!/^[0-9a-fA-F]{64}$/.test(trimmedKey)) {
+    fail('ENCRYPTION_KEY', 'must be 64 hexadecimal characters (0-9, a-f, A-F) — run `npm run generate-key``);
+    return false;
+  }
+  
+  pass('ENCRYPTION_KEY', 'valid (64 hex chars)');
   return true;
 }
 
