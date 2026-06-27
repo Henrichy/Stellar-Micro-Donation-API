@@ -15,11 +15,11 @@ const StellarSdk = require('stellar-sdk');
 const { issueAccessToken } = require('./JwtService');
 const log = require('../utils/log');
 const { ValidationError, ERROR_CODES } = require('../utils/errors');
+const db = require('../utils/database');
 
 class SEP10Service {
   constructor(stellarService, config = {}) {
     this.stellarService = stellarService;
-    this.challengeStore = new Map();
     this.challengePrefix = config.challengePrefix || 'web_auth_';
     this.config = {
       challengeExpiresIn: config.challengeExpiresIn || 15 * 60 * 1000, // default 15 minutes
@@ -50,7 +50,7 @@ class SEP10Service {
         );
       }
 
-      this._cleanupExpiredChallenges();
+      await this._cleanupExpiredChallenges();
 
       const serverKeypair = StellarSdk.Keypair.fromSecret(this.config.serverSigningKey);
       const serverAccount = await this.stellarService.loadAccount(serverKeypair.publicKey());
@@ -75,7 +75,7 @@ class SEP10Service {
 
       transaction.sign(serverKeypair);
 
-      this._registerChallenge(challengeId, clientAccount, expiresAtMs);
+      await this._registerChallenge(challengeId, clientAccount, expiresAtMs);
 
       log.info('SEP10', 'Challenge transaction generated', {
         clientAccount: this._maskPublicKey(clientAccount),
@@ -117,8 +117,8 @@ class SEP10Service {
       this._verifyServerSignature(transaction);
       this._verifyTransactionSignatures(transaction, clientAccount);
 
-      this._getChallengeEntry(memoPayload.challengeId, clientAccount);
-      this._markChallengeUsed(memoPayload.challengeId);
+      await this._getChallengeEntry(memoPayload.challengeId, clientAccount);
+      await this._markChallengeUsed(memoPayload.challengeId);
 
       log.info('SEP10', 'Challenge verification successful', {
         account: this._maskPublicKey(clientAccount)
@@ -159,39 +159,36 @@ class SEP10Service {
   }
 
   /**
-   * Register issued challenge for replay detection and TTL enforcement
+   * Register issued challenge in the database for replay detection and TTL enforcement
    * @private
    */
-  _registerChallenge(challengeId, clientAccount, expiresAt) {
-    this.challengeStore.set(challengeId, {
-      account: clientAccount,
-      expiresAt,
-      issuedAt: Date.now(),
-      used: false,
-    });
+  async _registerChallenge(challengeId, clientAccount, expiresAt) {
+    await db.run(
+      `INSERT INTO sep10_challenges (challengeId, account, expiresAt, issuedAt, used)
+       VALUES (?, ?, ?, ?, 0)`,
+      [challengeId, clientAccount, expiresAt, Date.now()]
+    );
   }
 
   /**
-   * Clean up expired challenges from the in-memory store
+   * Delete expired challenges from the database
    * @private
    */
-  _cleanupExpiredChallenges() {
-    const now = Date.now();
-    for (const [key, entry] of this.challengeStore.entries()) {
-      if (entry.expiresAt <= now) {
-        this.challengeStore.delete(key);
-      }
-    }
+  async _cleanupExpiredChallenges() {
+    await db.run('DELETE FROM sep10_challenges WHERE expiresAt <= ?', [Date.now()]);
   }
 
   /**
    * Fetch a challenge entry and assert it is still valid for the given account
    * @private
    */
-  _getChallengeEntry(challengeId, clientAccount) {
-    this._cleanupExpiredChallenges();
+  async _getChallengeEntry(challengeId, clientAccount) {
+    await this._cleanupExpiredChallenges();
 
-    const entry = this.challengeStore.get(challengeId);
+    const entry = await db.get(
+      'SELECT * FROM sep10_challenges WHERE challengeId = ?',
+      [challengeId]
+    );
     if (!entry) {
       throw new ValidationError(
         'Challenge transaction has expired or was not issued by this server',
@@ -223,12 +220,11 @@ class SEP10Service {
    * Mark a challenge as consumed to prevent replay
    * @private
    */
-  _markChallengeUsed(challengeId) {
-    const entry = this.challengeStore.get(challengeId);
-    if (entry) {
-      entry.used = true;
-      entry.usedAt = Date.now();
-    }
+  async _markChallengeUsed(challengeId) {
+    await db.run(
+      'UPDATE sep10_challenges SET used = 1, usedAt = ? WHERE challengeId = ?',
+      [Date.now(), challengeId]
+    );
   }
 
   /**

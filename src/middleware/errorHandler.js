@@ -108,7 +108,7 @@ function errorHandler(err, req, res, next) {
   const isProduction = process.env.NODE_ENV === 'production';
   const lang = parseLanguage(req.headers && req.headers['accept-language']);
 
-  // Log 1: detailed context
+  // Log detailed context server-side only
   log.error("ERROR_HANDLER", "Error occurred", {
     requestId: req.id,
     path: req.path,
@@ -119,22 +119,12 @@ function errorHandler(err, req, res, next) {
       code: err.errorCode || err.code,
       numericCode: err.numericCode,
       statusCode: err.statusCode || err.status,
-      ...(!isProduction && { stack: err.stack }),
+      stack: err.stack, // server-side only, never sent to client
       ...(err.details && { details: maskSensitiveData(err.details) }),
     },
     ...(req.get && { userAgent: req.get("User-Agent") }),
     ...(req.ip && { ip: req.ip }),
     timestamp: new Date().toISOString(),
-  });
-
-  // Log 2: simple audit trail
-  log.error('ERROR_HANDLER', 'Error occurred', {
-    requestId: req.id,
-    path: req.path,
-    method: req.method,
-    error: err.message,
-    code: err.errorCode || err.code,
-    numericCode: err.numericCode,
   });
 
   res.set('Content-Language', lang);
@@ -147,6 +137,9 @@ function errorHandler(err, req, res, next) {
     if (translated) errorBody.error.message = translated;
     if (!isProduction) {
       errorBody.error.debug = { name: err.name };
+    } else {
+      // Strip any details that might contain internal info in production
+      delete errorBody.error.details;
     }
     // Set X-Limit-Reset header for velocity limit errors
     if (err.statusCode === 429 && err.resetAt) {

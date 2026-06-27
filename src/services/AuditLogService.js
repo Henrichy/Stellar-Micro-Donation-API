@@ -126,12 +126,6 @@ const auditLogMetrics = {
   totalFailures: 0,
 };
 
-/** In-memory buffer for pending audit log entries */
-const _pendingBuffer = [];
-const _BUFFER_FLUSH_THRESHOLD = 20;
-const BUFFER_FLUSH_INTERVAL_MS = 2000;
-let _autoFlushTimer = null;
-
 class AuditLogService {
   /**
    * Return a snapshot of audit log failure metrics.
@@ -389,10 +383,9 @@ class AuditLogService {
   }
 
   /**
-   * Write all buffered entries to the database in a single transaction.
-   * Has a 5-second timeout; on timeout the buffered entries are written to stderr and the
-   * buffer is cleared so that shutdown can proceed.
-   * Safe to call multiple times (idempotent).
+   * Flush pending audit entries to the database.
+   * All audit entries are written synchronously on each call to _log(), so this
+   * is a no-op kept for API compatibility with the shutdown sequence.
    * @returns {Promise<void>}
    */
   static async flush() {
@@ -440,7 +433,8 @@ class AuditLogService {
   }
 
   /**
-   * Start the periodic auto-flush timer.
+   * Start periodic maintenance (cleans up any stale state).
+   * Kept for API compatibility with server bootstrap.
    * @returns {void}
    */
   static startAutoFlush() {
@@ -454,7 +448,8 @@ class AuditLogService {
   }
 
   /**
-   * Stop the periodic auto-flush timer.
+   * Stop periodic maintenance.
+   * Kept for API compatibility with server bootstrap.
    * @returns {void}
    */
   static stopAutoFlush() {
