@@ -201,6 +201,68 @@ class MemoValidator {
   }
 
   /**
+   * Validate the FINAL on-chain memo byte length after any encryption/encoding
+   * transforms have been applied, using the correct per-type byte limit.
+   *
+   * - MEMO_TEXT: ≤ 28 bytes (UTF-8)
+   * - MEMO_HASH / MEMO_RETURN: exactly 32 bytes (64 hex chars)
+   * - MEMO_ID: valid uint64 string
+   *
+   * Should be called in the transaction-build path, before submitting to
+   * Stellar, so over-limit memos are rejected with a 422 rather than surfacing
+   * as a confusing Horizon error.
+   *
+   * @param {string} memo - The final memo value that will go on-chain
+   * @param {string} [memoType='text']
+   * @returns {{ valid: boolean, error?: string, code?: string, byteLength?: number, limit?: number }}
+   */
+  static validateFinalMemo(memo, memoType = 'text') {
+    if (memo === undefined || memo === null || memo === '') {
+      return { valid: true };
+    }
+
+    switch (memoType) {
+      case 'text': {
+        const str = String(memo);
+        const byteLength = Buffer.byteLength(str, 'utf8');
+        if (byteLength > MAX_MEMO_LENGTH) {
+          return {
+            valid: false,
+            error: `Memo byte length (${byteLength}) exceeds the ${MAX_MEMO_LENGTH}-byte UTF-8 limit for MEMO_TEXT. Use MEMO_HASH for longer payloads or shorten the memo.`,
+            code: 'MEMO_TOO_LONG',
+            byteLength,
+            limit: MAX_MEMO_LENGTH,
+          };
+        }
+        return { valid: true, byteLength };
+      }
+
+      case 'hash':
+      case 'return': {
+        const hex = String(memo).trim().toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(hex)) {
+          return {
+            valid: false,
+            error: `${memoType} memo must be exactly 32 bytes represented as a 64-character hex string; got ${String(memo).length} characters.`,
+            code: 'INVALID_MEMO_HASH',
+          };
+        }
+        return { valid: true };
+      }
+
+      case 'id':
+        return this._validateId(memo);
+
+      default:
+        return {
+          valid: false,
+          error: `Unknown memo type: "${memoType}". Must be one of: ${MEMO_TYPES.join(', ')}`,
+          code: 'INVALID_MEMO_TYPE',
+        };
+    }
+  }
+
+  /**
    * Get maximum memo length
    * @returns {number} Maximum memo length in bytes
    */

@@ -719,6 +719,15 @@ class StellarService extends StellarServiceInterface {
         .setTimeout(30);
 
       if (memo) {
+        const MemoValidator = require('../utils/memoValidator');
+        const memoCheck = MemoValidator.validateFinalMemo(memo, memoType);
+        if (!memoCheck.valid) {
+          const err = new Error(memoCheck.error);
+          err.code = memoCheck.code;
+          err.statusCode = 422;
+          throw err;
+        }
+
         switch (memoType) {
           case 'hash':
             transaction.addMemo(StellarSdk.Memo.hash(Buffer.from(memo, 'hex')));

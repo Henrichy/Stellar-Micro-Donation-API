@@ -304,7 +304,25 @@ class Transaction {
     const nextStatus = normalizeState(status);
     assertValidState(currentStatus, 'current status');
     assertValidState(nextStatus, 'target status');
-    assertValidTransition(currentStatus, nextStatus);
+
+    try {
+      assertValidTransition(currentStatus, nextStatus);
+    } catch (transitionErr) {
+      const AuditLogService = require('../services/AuditLogService');
+      AuditLogService.log({
+        category: AuditLogService.CATEGORY.FINANCIAL_OPERATION,
+        action: 'ILLEGAL_STATE_TRANSITION_REJECTED',
+        severity: AuditLogService.SEVERITY.HIGH,
+        result: 'FAILURE',
+        resource: `transaction:${id}`,
+        details: {
+          transactionId: id,
+          fromState: currentStatus,
+          toState: nextStatus,
+        },
+      }).catch(() => {});
+      throw transitionErr;
+    }
 
     const previousStatusTimestamp = new Date(tx.statusUpdatedAt || tx.timestamp || 0).getTime();
     const nextStatusTimestamp = new Date(Math.max(Date.now(), previousStatusTimestamp + 1)).toISOString();

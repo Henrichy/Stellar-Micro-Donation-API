@@ -10,6 +10,12 @@
  *   POST /impact/report/export        — downloadable CSV or PDF report
  */
 
+const STROOPS_PER_XLM = 10_000_000n;
+
+function toStroops(xlmAmount) {
+  return BigInt(Math.round(Number(xlmAmount) * Number(STROOPS_PER_XLM)));
+}
+
 const express = require('express');
 const router = express.Router();
 const requireApiKey = require('../middleware/apiKey');
@@ -61,20 +67,24 @@ function filterByDateRange(txs, startDate, endDate) {
 function buildSdgBreakdown(txs) {
   const map = {};
   for (const sdg of SDG_CATEGORIES) {
-    map[sdg.code] = { ...sdg, totalAmount: 0, count: 0 };
+    map[sdg.code] = { ...sdg, totalAmountStroops: 0n, count: 0 };
   }
 
   for (const tx of txs) {
     const cats = Array.isArray(tx.sdgCategories) ? tx.sdgCategories : [];
     for (const code of cats) {
       if (map[code]) {
-        map[code].totalAmount += parseFloat(tx.amount) || 0;
+        map[code].totalAmountStroops += toStroops(tx.amount);
         map[code].count += 1;
       }
     }
   }
 
-  return Object.values(map);
+  return Object.values(map).map(s => ({
+    ...s,
+    totalAmount: s.totalAmountStroops.toString(),
+    totalAmountStroops: undefined,
+  }));
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -114,7 +124,7 @@ router.get('/report', checkPermission(PERMISSIONS.DONATIONS_READ), (req, res, ne
     const txs = filterByDateRange(Transaction.getAll(), startDate, endDate);
     const breakdown = buildSdgBreakdown(txs);
 
-    const totalAmount = txs.reduce((sum, tx) => sum + (parseFloat(tx.amount) || 0), 0);
+    const totalAmountStroops = txs.reduce((sum, tx) => sum + toStroops(tx.amount), 0n);
     const taggedCount = txs.filter(tx => Array.isArray(tx.sdgCategories) && tx.sdgCategories.length > 0).length;
     const activeSdgs = breakdown.filter(s => s.count > 0);
 
@@ -125,12 +135,12 @@ router.get('/report', checkPermission(PERMISSIONS.DONATIONS_READ), (req, res, ne
         dateRange: { startDate: startDate || null, endDate: endDate || null },
         summary: {
           totalDonations: txs.length,
-          totalAmount: parseFloat(totalAmount.toFixed(7)),
+          totalAmount: totalAmountStroops.toString(),
           taggedDonations: taggedCount,
           activeSdgCount: activeSdgs.length,
         },
         sdgBreakdown: breakdown,
-        topSdgs: [...activeSdgs].sort((a, b) => b.totalAmount - a.totalAmount).slice(0, 5),
+        topSdgs: [...activeSdgs].sort((a, b) => (BigInt(a.totalAmount) > BigInt(b.totalAmount) ? -1 : 1)).slice(0, 5),
       },
     });
   } catch (error) {
@@ -157,16 +167,16 @@ router.post('/report/export', requireApiKey, checkPermission(PERMISSIONS.DONATIO
 
     const txs = filterByDateRange(Transaction.getAll(), startDate, endDate);
     const breakdown = buildSdgBreakdown(txs);
-    const totalAmount = txs.reduce((sum, tx) => sum + (parseFloat(tx.amount) || 0), 0);
+    const totalAmountStroops = txs.reduce((sum, tx) => sum + toStroops(tx.amount), 0n);
 
     if (format === 'csv') {
       const lines = [
-        'SDG Code,Goal,Title,Total Amount (XLM),Donation Count',
+        'SDG Code,Goal,Title,Total Amount (stroops),Donation Count',
         ...breakdown.map(s =>
-          `${escapeCsvFormula(s.code)},${escapeCsvFormula(s.goal)},"${escapeCsvFormula(s.title)}",${s.totalAmount.toFixed(7)},${s.count}`
+          `${escapeCsvFormula(s.code)},${escapeCsvFormula(s.goal)},"${escapeCsvFormula(s.title)}",${s.totalAmount},${s.count}`
         ),
         '',
-        `Total,,All SDGs,${totalAmount.toFixed(7)},${txs.length}`,
+        `Total,,All SDGs,${totalAmountStroops.toString()},${txs.length}`,
       ];
 
       res.setHeader('Content-Type', 'text/csv');
@@ -183,10 +193,10 @@ router.post('/report/export', requireApiKey, checkPermission(PERMISSIONS.DONATIO
       '',
       'SDG Breakdown:',
       ...breakdown.filter(s => s.count > 0).map(s =>
-        `  ${s.code} - ${s.title}: ${s.totalAmount.toFixed(7)} XLM (${s.count} donations)`
+        `  ${s.code} - ${s.title}: ${s.totalAmount} stroops (${s.count} donations)`
       ),
       '',
-      `Total: ${totalAmount.toFixed(7)} XLM across ${txs.length} donations`,
+      `Total: ${totalAmountStroops.toString()} stroops across ${txs.length} donations`,
     ].filter(l => l !== undefined).join('\n');
 
     // Minimal valid PDF wrapping plain text

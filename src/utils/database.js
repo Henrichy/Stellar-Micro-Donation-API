@@ -921,6 +921,54 @@ class Database {
   }
 
   /**
+   * Execute multiple operations within a single SQLite transaction on one connection.
+   * All operations either commit or rollback together.
+   *
+   * @param {function(tx: {run, get, all}): Promise<*>} callback - Async function receiving bound DB methods.
+   * @returns {Promise<*>} The value returned by the callback.
+   */
+  static async runTransaction(callback) {
+    await this.ensureInitialized();
+    const lease = await this.acquireConnection();
+    const db = lease.db;
+
+    const runOnConn = (sql, params = []) => new Promise((resolve, reject) => {
+      db.run(sql, params, function(err) {
+        if (err) return reject(Database.mapDatabaseError(err, 'Transaction operation failed'));
+        resolve({ id: this.lastID, changes: this.changes });
+      });
+    });
+
+    const getOnConn = (sql, params = []) => new Promise((resolve, reject) => {
+      db.get(sql, params, (err, row) => {
+        if (err) return reject(Database.mapDatabaseError(err, 'Transaction query failed'));
+        resolve(row);
+      });
+    });
+
+    const allOnConn = (sql, params = []) => new Promise((resolve, reject) => {
+      db.all(sql, params, (err, rows) => {
+        if (err) return reject(Database.mapDatabaseError(err, 'Transaction query failed'));
+        resolve(rows);
+      });
+    });
+
+    const tx = { run: runOnConn, get: getOnConn, all: allOnConn };
+
+    try {
+      await runOnConn('BEGIN IMMEDIATE');
+      const result = await callback(tx);
+      await runOnConn('COMMIT');
+      return result;
+    } catch (err) {
+      try { await runOnConn('ROLLBACK'); } catch (_) {}
+      throw err;
+    } finally {
+      await lease.release().catch(() => {});
+    }
+  }
+
+  /**
    * Expose pool metrics for health checks and diagnostics.
    *
    * @returns {{total: number, active: number, idle: number, waiting: number, size: number, acquireTimeout: number}}

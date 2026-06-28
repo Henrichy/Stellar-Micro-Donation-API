@@ -1,6 +1,13 @@
 const Transaction = require('../models/transaction');
 const Cache = require('../utils/cache');
 
+const STROOPS_PER_XLM = 10_000_000n;
+
+/** Convert an XLM float amount from the in-memory store to BigInt stroops. */
+function toStroops(xlmAmount) {
+  return BigInt(Math.round(Number(xlmAmount) * Number(STROOPS_PER_XLM)));
+}
+
 /**
  * Leaderboard cache TTL in milliseconds (1 minute)
  */
@@ -473,7 +480,7 @@ class StatsService {
       t.status === 'confirmed' || t.status === 'COMPLETED'
     );
 
-    // Aggregate by donor
+    // Aggregate by donor using BigInt stroops to avoid precision loss
     const donorMap = new Map();
     confirmedTransactions.forEach(tx => {
       const donor = tx.donor || 'Anonymous';
@@ -481,7 +488,7 @@ class StatsService {
         donorMap.set(donor, {
           rank: 0,
           donor,
-          totalDonated: 0,
+          totalDonatedStroops: 0n,
           donationCount: 0,
           lastDonationAt: null,
           period
@@ -489,22 +496,26 @@ class StatsService {
       }
 
       const donorEntry = donorMap.get(donor);
-      donorEntry.totalDonated += parseFloat(tx.amount) || 0;
+      donorEntry.totalDonatedStroops += toStroops(tx.amount);
       donorEntry.donationCount += 1;
-      
+
       const txDate = new Date(tx.timestamp);
       if (!donorEntry.lastDonationAt || txDate > new Date(donorEntry.lastDonationAt)) {
         donorEntry.lastDonationAt = tx.timestamp;
       }
     });
 
-    // Sort by total donated (descending) and assign ranks
+    // Sort by total donated (descending) and assign ranks; output stroops as string
     const leaderboard = Array.from(donorMap.values())
-      .sort((a, b) => b.totalDonated - a.totalDonated)
+      .sort((a, b) => (a.totalDonatedStroops > b.totalDonatedStroops ? -1 : a.totalDonatedStroops < b.totalDonatedStroops ? 1 : 0))
       .slice(0, limit)
       .map((entry, index) => ({
-        ...entry,
-        rank: index + 1
+        rank: index + 1,
+        donor: entry.donor,
+        totalDonated: entry.totalDonatedStroops.toString(),
+        donationCount: entry.donationCount,
+        lastDonationAt: entry.lastDonationAt,
+        period: entry.period,
       }));
 
     // Cache the result
@@ -543,7 +554,7 @@ class StatsService {
       t.status === 'confirmed' || t.status === 'COMPLETED'
     );
 
-    // Aggregate by recipient
+    // Aggregate by recipient using BigInt stroops to avoid precision loss
     const recipientMap = new Map();
     confirmedTransactions.forEach(tx => {
       const recipient = tx.recipient || 'Unknown';
@@ -551,7 +562,7 @@ class StatsService {
         recipientMap.set(recipient, {
           rank: 0,
           recipient,
-          totalReceived: 0,
+          totalReceivedStroops: 0n,
           donationCount: 0,
           lastReceivedAt: null,
           period
@@ -559,22 +570,26 @@ class StatsService {
       }
 
       const recipientEntry = recipientMap.get(recipient);
-      recipientEntry.totalReceived += parseFloat(tx.amount) || 0;
+      recipientEntry.totalReceivedStroops += toStroops(tx.amount);
       recipientEntry.donationCount += 1;
-      
+
       const txDate = new Date(tx.timestamp);
       if (!recipientEntry.lastReceivedAt || txDate > new Date(recipientEntry.lastReceivedAt)) {
         recipientEntry.lastReceivedAt = tx.timestamp;
       }
     });
 
-    // Sort by total received (descending) and assign ranks
+    // Sort by total received (descending) and assign ranks; output stroops as string
     const leaderboard = Array.from(recipientMap.values())
-      .sort((a, b) => b.totalReceived - a.totalReceived)
+      .sort((a, b) => (a.totalReceivedStroops > b.totalReceivedStroops ? -1 : a.totalReceivedStroops < b.totalReceivedStroops ? 1 : 0))
       .slice(0, limit)
       .map((entry, index) => ({
-        ...entry,
-        rank: index + 1
+        rank: index + 1,
+        recipient: entry.recipient,
+        totalReceived: entry.totalReceivedStroops.toString(),
+        donationCount: entry.donationCount,
+        lastReceivedAt: entry.lastReceivedAt,
+        period: entry.period,
       }));
 
     // Cache the result
