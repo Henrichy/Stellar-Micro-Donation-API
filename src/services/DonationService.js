@@ -866,6 +866,27 @@ class DonationService {
       }
     }
 
+    // #1157: DB-level idempotency replay for createDonationRecord path.
+    // The in-memory check in Transaction.create only works within a single
+    // process lifetime; a DB lookup ensures at-most-once persistence across
+    // restarts and concurrent requests.
+    if (idempotencyKey) {
+      const existing = await Database.get(
+        'SELECT data FROM donations_store WHERE idempotency_key = ?',
+        [idempotencyKey]
+      );
+      if (existing) {
+        try {
+          const tx = JSON.parse(existing.data);
+          log.info('DONATION_SERVICE', 'Idempotency replay (createDonationRecord): returning existing', {
+            idempotencyKey,
+            id: tx.id,
+          });
+          return tx;
+        } catch (_) { /* fall through to create */ }
+      }
+    }
+
     // Create transaction record
     const transaction = Transaction.create({
       amount: xlmAmount,
