@@ -489,6 +489,14 @@ class Database {
         db.configure('busyTimeout', TIMEOUT_DEFAULTS.DATABASE);
       }
 
+      // #1145: enable WAL mode for improved concurrency (readers don't block writers)
+      await new Promise((resolve, reject) => {
+        db.run('PRAGMA journal_mode=WAL', (err) => {
+          if (err) reject(new DatabaseError('Failed to enable WAL journal mode', err));
+          else resolve();
+        });
+      });
+
       // #1155: enforce FK constraints on every connection (SQLite resets per connection)
       await new Promise((resolve, reject) => {
         db.run('PRAGMA foreign_keys=ON', (err) => {

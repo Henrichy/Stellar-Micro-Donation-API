@@ -14,6 +14,7 @@ const WebhookService = require('../services/WebhookService');
 const asyncHandler = require('../utils/asyncHandler');
 const { payloadSizeLimiter, ENDPOINT_LIMITS } = require('../middleware/payloadSizeLimiter');
 const { parseCursorPaginationQuery } = require('../utils/pagination');
+const { requireAdmin } = require('../middleware/rbac');
 
 /**
  * Middleware that verifies the X-Webhook-Signature header on incoming webhook payloads.
@@ -161,6 +162,22 @@ router.post('/:id/rotate-secret', requireApiKey, asyncHandler(async (req, res, n
     res.json({ success: true, data: result });
   } catch (err) {
     if (err.status === 404) return res.status(404).json({ success: false, error: { message: err.message } });
+    next(err);
+  }
+}));
+
+/**
+ * GET /webhooks/dead-letters
+ * List dead-letter entries (admin only). Issue #1144.
+ */
+router.get('/dead-letters', requireApiKey, requireAdmin(), asyncHandler(async (req, res, next) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const offset = parseInt(req.query.offset, 10) || 0;
+    const items = await WebhookService.WebhookService.listDeadLetters({ limit, offset });
+    const { getDlqMetrics } = require('../services/WebhookService');
+    res.json({ success: true, data: items, count: items.length, metrics: getDlqMetrics() });
+  } catch (err) {
     next(err);
   }
 }));

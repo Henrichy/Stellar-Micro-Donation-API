@@ -20,6 +20,14 @@ const { assertSafeOutboundUrl } = require('../utils/ssrf');
 const MAX_RETRIES = 3;
 const MAX_CONSECUTIVE_FAILURES = 5;
 const BASE_BACKOFF_MS = 1000;
+
+/** Monotonically incrementing counter for DLQ entries (issue #1144 metric) */
+let dlqEntriesTotal = 0;
+
+/** Return current DLQ metric count */
+function getDlqMetrics() {
+  return { dlqEntriesTotal };
+}
 const { 
   getCorrelationContext, 
   withAsyncContext, 
@@ -289,7 +297,8 @@ class WebhookService {
          VALUES (?, ?, ?, ?, ?)`,
         [webhookId, event, JSON.stringify(payload), attempt, lastError]
       );
-      log.warn('WEBHOOK_SERVICE', 'Delivery moved to dead-letter', { webhookId, event, attempt });
+      dlqEntriesTotal += 1;
+      log.warn('WEBHOOK_SERVICE', 'Delivery moved to dead-letter', { webhookId, event, attempt, dlqEntriesTotal });
       
       // Notify webhook owner
       const webhook = await Database.get(`SELECT * FROM webhooks WHERE id = ?`, [webhookId]);
@@ -754,6 +763,7 @@ class WebhookService {
 
 module.exports = new WebhookService();
 module.exports.WebhookService = WebhookService;
+module.exports.getDlqMetrics = getDlqMetrics;
 
 
 
