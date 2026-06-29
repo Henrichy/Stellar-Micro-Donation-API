@@ -13,6 +13,7 @@ const { checkPermission } = require('../../middleware/rbac');
 const { PERMISSIONS } = require('../../utils/permissions');
 const Database = require('../../utils/database');
 const { createRateLimiter } = require('../../middleware/rateLimiter');
+const asyncHandler = require('../../utils/asyncHandler');
 
 const dbStatsRateLimiter = createRateLimiter({
   windowMs: 60 * 1000,
@@ -211,7 +212,7 @@ router.get('/query-stats', checkPermission(PERMISSIONS.ADMIN_ALL), (req, res, ne
  * Returns comprehensive database statistics. Cached for 60 seconds.
  * ?refresh=true bypasses the cache.
  */
-router.get('/stats', dbStatsRateLimiter, checkPermission(PERMISSIONS.ADMIN_ALL), async (req, res, next) => {
+router.get('/stats', dbStatsRateLimiter, checkPermission(PERMISSIONS.ADMIN_ALL), asyncHandler(async (req, res, next) => {
   try {
     const now = Date.now();
     const bypass = req.query.refresh === 'true';
@@ -288,7 +289,7 @@ router.get('/stats', dbStatsRateLimiter, checkPermission(PERMISSIONS.ADMIN_ALL),
   } catch (error) {
     next(error);
   }
-});
+}));
 
 // In-memory vacuum job store
 const vacuumJobs = new Map();
@@ -299,7 +300,7 @@ let activeVacuumJobId = null;
  * Starts a background VACUUM job. Returns immediately with a jobId.
  * Only one vacuum job may run at a time.
  */
-router.post('/vacuum', checkPermission(PERMISSIONS.ADMIN_ALL), async (req, res) => {
+router.post('/vacuum', checkPermission(PERMISSIONS.ADMIN_ALL), asyncHandler(async (req, res) => {
   if (activeVacuumJobId && vacuumJobs.get(activeVacuumJobId)?.status === 'running') {
     return res.status(409).json({ success: false, error: { code: 'VACUUM_IN_PROGRESS', message: 'A vacuum job is already running' } });
   }
@@ -337,7 +338,7 @@ router.post('/vacuum', checkPermission(PERMISSIONS.ADMIN_ALL), async (req, res) 
   });
 
   res.json({ success: true, jobId });
-});
+}));
 
 /**
  * GET /admin/db/vacuum/:jobId

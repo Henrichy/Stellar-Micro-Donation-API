@@ -275,7 +275,7 @@ const sendDonationSchema = validateSchema({
  * Requires idempotency key to prevent duplicate transactions
  * Rate limited: 10 requests per minute per IP
  */
-router.post('/send', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRateLimiter, requireIdempotency, sendDonationSchema, async (req, res, next) => {
+router.post('/send', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRateLimiter, requireIdempotency, sendDonationSchema, asyncHandler(async (req, res, next) => {
   try {
     const { senderId, receiverId, amount, memo, campaign_id } = req.body;
 
@@ -402,7 +402,7 @@ router.post('/send', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donatio
       message: error.message
     });
   }
-});
+}));
 
 /**
  * POST /donations/batch
@@ -410,7 +410,7 @@ router.post('/send', payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donatio
  * Donations with the same donor are grouped into multi-operation Stellar transactions.
  * Rate limited: 10 batch requests per minute per IP.
  */
-router.post('/batch', payloadSizeLimiter(ENDPOINT_LIMITS.batchDonation), batchRateLimiter, requireApiKey, async (req, res, next) => {
+router.post('/batch', payloadSizeLimiter(ENDPOINT_LIMITS.batchDonation), batchRateLimiter, requireApiKey, asyncHandler(async (req, res, next) => {
   try {
     const { donations } = req.body;
 
@@ -452,7 +452,7 @@ router.post('/batch', payloadSizeLimiter(ENDPOINT_LIMITS.batchDonation), batchRa
   } catch (error) {
     next(error);
   }
-});
+}));
 
 const createDonationSchema = validateSchema({
   body: {
@@ -498,7 +498,7 @@ const createDonationSchema = validateSchema({
  * Explicit 30s timeout (TIMEOUTS.donation) — this route submits to Horizon,
  * which is the slowest operation in the API.
  */
-router.post('/', requestTimeout(TIMEOUTS.donation), payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRateLimiter, perKeyRateLimit, requireApiKey, requireIdempotency, createDonationSchema, async (req, res, next) => {
+router.post('/', requestTimeout(TIMEOUTS.donation), payloadSizeLimiter(ENDPOINT_LIMITS.singleDonation), donationRateLimiter, perKeyRateLimit, requireApiKey, requireIdempotency, createDonationSchema, asyncHandler(async (req, res, next) => {
   try {
     // Custodial mode: when both senderId and receiverId are supplied, the parties
     // are wallet/user ids rather than on-chain addresses — route to the custodial flow.
@@ -631,7 +631,7 @@ router.post('/', requestTimeout(TIMEOUTS.donation), payloadSizeLimiter(ENDPOINT_
   } catch (error) {
     next(error);
   }
-});
+}));
 
 /**
  * GET /donations/verify-anonymous
@@ -643,7 +643,7 @@ router.post('/', requestTimeout(TIMEOUTS.donation), payloadSizeLimiter(ENDPOINT_
  *
  * Returns { verified: boolean, donationId, pseudonymousId, amount, recipient, timestamp }
  */
-router.get('/verify-anonymous', checkPermission(PERMISSIONS.DONATIONS_READ), async (req, res, next) => {
+router.get('/verify-anonymous', checkPermission(PERMISSIONS.DONATIONS_READ), asyncHandler(async (req, res, next) => {
   try {
     const { donationId, walletAddress } = req.query;
 
@@ -667,7 +667,7 @@ router.get('/verify-anonymous', checkPermission(PERMISSIONS.DONATIONS_READ), asy
   } catch (error) {
     next(error);
   }
-});
+}));
 
 /**
  * GET /donations/cost-breakdown
