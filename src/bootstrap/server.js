@@ -44,6 +44,7 @@ const retentionService = require('../services/RetentionService');
 const Database = require('../utils/database');
 const { startQuotaResetJob } = require('../jobs/quotaResetJob');
 const { runCleanup } = require('../jobs/cleanupJob');
+const reconcileTotalsJob = require('../jobs/reconcileTotalsJob');
 const { logStartupDiagnostics, logShutdownDiagnostics } = require('../utils/startupDiagnostics');
 const replayDetectionMiddleware = require('../middleware/replayDetection');
 const log = require('../utils/log');
@@ -185,6 +186,8 @@ async function startServer(app, overrideServices = {}) {
           runCleanup();
           cleanupInterval = timerRegistry.createInterval(runCleanup, 24 * 60 * 60 * 1000, 'cleanup-job');
           cleanupInterval.unref();
+
+          reconcileTotalsJob.start();
 
           // Load persisted circuit-breaker state and start cross-instance sync
           if (stellarService.circuitBreaker) {

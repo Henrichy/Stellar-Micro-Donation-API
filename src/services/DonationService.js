@@ -308,15 +308,19 @@ class DonationService {
       ledger: stellarResult.ledger
     });
 
-    // #1156: Wrap DB write atomically so partial failures roll back.
-    // The Stellar transaction is already committed at this point — the DB write
-    // is the only rollback-able side-effect, so we wrap only these writes.
+    // Record in database with sanitized memo — amount stored as integer stroops.
+    // The totals table update is atomic with the transactions INSERT so that a
+    // rollback can never leave totals incremented without a corresponding row.
     const amountStroops = Math.round(parseFloat(amount) * STROOPS_PER_XLM);
-    const dbResult = await Database.runTransaction(async ({ run }) => {
-      return run(
+    const DonationTotalsRepository = require('./DonationTotalsRepository');
+    const totalsRepo = new DonationTotalsRepository();
+    const dbResult = await Database.runTransaction(async (tx) => {
+      const r = await tx.run(
         'INSERT INTO transactions (senderId, receiverId, amount, memo, notes, tags, timestamp, idempotencyKey, stellar_tx_id) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)',
         [senderId, receiverId, amountStroops, sanitizedMemo, notes || null, JSON.stringify(tags || []), idempotencyKey, stellarResult.transactionId]
       );
+      await totalsRepo.incrementTotal(String(receiverId), amountStroops, tx);
+      return r;
     });
 
     // Emit donation.created to trigger cache invalidation and other listeners (non-blocking)

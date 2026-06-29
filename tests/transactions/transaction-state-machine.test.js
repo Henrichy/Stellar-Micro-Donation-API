@@ -1,5 +1,6 @@
 const {
   TRANSACTION_STATES,
+  VALID_TRANSITIONS,
   normalizeState,
   canTransition,
   assertValidState,
@@ -12,6 +13,12 @@ describe('Transaction State Machine', () => {
     expect(normalizeState('cancelled')).toBe(TRANSACTION_STATES.FAILED);
   });
 
+  test('should normalize null/undefined to PENDING', () => {
+    expect(normalizeState(null)).toBe(TRANSACTION_STATES.PENDING);
+    expect(normalizeState(undefined)).toBe(TRANSACTION_STATES.PENDING);
+    expect(normalizeState('')).toBe(TRANSACTION_STATES.PENDING);
+  });
+
   test('should validate known states', () => {
     expect(() => assertValidState(TRANSACTION_STATES.PENDING)).not.toThrow();
     expect(() => assertValidState(TRANSACTION_STATES.SUBMITTED)).not.toThrow();
@@ -21,16 +28,50 @@ describe('Transaction State Machine', () => {
 
   test('should reject unknown states', () => {
     expect(() => assertValidState('cancelled')).toThrow('Invalid transaction state');
+    expect(() => assertValidState('processing')).toThrow('Invalid transaction state');
   });
 
-  test('should allow valid transitions', () => {
-    expect(canTransition('pending', 'submitted')).toBe(true);
-    expect(canTransition('submitted', 'confirmed')).toBe(true);
-    expect(canTransition('submitted', 'failed')).toBe(true);
+  test('VALID_TRANSITIONS is exported and data-driven', () => {
+    expect(VALID_TRANSITIONS).toBeDefined();
+    expect(VALID_TRANSITIONS[TRANSACTION_STATES.PENDING]).toBeInstanceOf(Set);
+    expect(VALID_TRANSITIONS[TRANSACTION_STATES.FAILED].size).toBe(0);
   });
 
-  test('should block invalid transitions', () => {
-    expect(canTransition('failed', 'confirmed')).toBe(false);
-    expect(() => assertValidTransition('failed', 'confirmed')).toThrow('Invalid transaction state transition');
+  describe('should allow valid transitions', () => {
+    const legalTransitions = [
+      ['pending',   'submitted'],
+      ['pending',   'confirmed'],
+      ['pending',   'failed'],
+      ['submitted', 'confirmed'],
+      ['submitted', 'failed'],
+      ['confirmed', 'failed'],
+    ];
+
+    test.each(legalTransitions)('%s → %s', (from, to) => {
+      expect(canTransition(from, to)).toBe(true);
+      expect(() => assertValidTransition(from, to)).not.toThrow();
+    });
+  });
+
+  describe('should block invalid transitions', () => {
+    const illegalTransitions = [
+      ['failed',    'confirmed'],
+      ['failed',    'submitted'],
+      ['failed',    'pending'],
+      ['confirmed', 'pending'],
+      ['confirmed', 'submitted'],
+      ['submitted', 'pending'],
+    ];
+
+    test.each(illegalTransitions)('%s → %s is blocked', (from, to) => {
+      expect(canTransition(from, to)).toBe(false);
+      expect(() => assertValidTransition(from, to)).toThrow('Invalid transaction state transition');
+    });
+  });
+
+  test('identity transitions (same state) are allowed', () => {
+    for (const state of Object.values(TRANSACTION_STATES)) {
+      expect(canTransition(state, state)).toBe(true);
+    }
   });
 });

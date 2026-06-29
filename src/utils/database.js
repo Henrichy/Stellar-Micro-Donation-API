@@ -929,47 +929,50 @@ class Database {
   }
 
   /**
-   * Execute multiple writes atomically in a single DB transaction.
-   * Acquires one connection, runs BEGIN, calls fn(db), then COMMITs.
-   * Rolls back and re-throws on any error so callers get a clean abort.
+   * Execute multiple operations within a single SQLite transaction on one connection.
+   * All operations either commit or rollback together.
    *
-   * @param {Function} fn - Async callback receiving the raw sqlite3 db handle.
-   *   Use db.run / db.get / db.all directly inside fn (promisified as needed).
-   * @returns {Promise<*>} The value returned by fn.
+   * @param {function(tx: {run, get, all}): Promise<*>} callback - Async function receiving bound DB methods.
+   * @returns {Promise<*>} The value returned by the callback.
    */
-  static async runTransaction(fn) {
+  static async runTransaction(callback) {
+    await this.ensureInitialized();
     const lease = await this.acquireConnection();
     const db = lease.db;
 
-    /** Promisify a single db.run call on the acquired connection */
-    const run = (sql, params = []) => new Promise((resolve, reject) => {
-      db.run(sql, params, function callback(err) {
-        if (err) reject(Database.mapDatabaseError(err, 'Transaction statement failed'));
-        else resolve({ id: this.lastID, changes: this.changes });
+    const runOnConn = (sql, params = []) => new Promise((resolve, reject) => {
+      db.run(sql, params, function(err) {
+        if (err) return reject(Database.mapDatabaseError(err, 'Transaction operation failed'));
+        resolve({ id: this.lastID, changes: this.changes });
       });
     });
 
-    /** Promisify a single db.get call */
-    const get = (sql, params = []) => new Promise((resolve, reject) => {
+    const getOnConn = (sql, params = []) => new Promise((resolve, reject) => {
       db.get(sql, params, (err, row) => {
-        if (err) reject(Database.mapDatabaseError(err, 'Transaction query failed'));
-        else resolve(row);
+        if (err) return reject(Database.mapDatabaseError(err, 'Transaction query failed'));
+        resolve(row);
       });
     });
+
+    const allOnConn = (sql, params = []) => new Promise((resolve, reject) => {
+      db.all(sql, params, (err, rows) => {
+        if (err) return reject(Database.mapDatabaseError(err, 'Transaction query failed'));
+        resolve(rows);
+      });
+    });
+
+    const tx = { run: runOnConn, get: getOnConn, all: allOnConn };
 
     try {
-      await run('BEGIN');
-      let result;
-      try {
-        result = await fn({ run, get });
-        await run('COMMIT');
-      } catch (err) {
-        try { await run('ROLLBACK'); } catch (_) { /* best-effort rollback */ }
-        throw err;
-      }
+      await runOnConn('BEGIN IMMEDIATE');
+      const result = await callback(tx);
+      await runOnConn('COMMIT');
       return result;
+    } catch (err) {
+      try { await runOnConn('ROLLBACK'); } catch (_) {}
+      throw err;
     } finally {
-      await lease.release();
+      await lease.release().catch(() => {});
     }
   }
 

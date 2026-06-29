@@ -29,15 +29,20 @@ module.exports = async function createTestTables(Database) {
     expiresAt DATETIME,
     UNIQUE(apiKeyId, idempotencyKey)
   )`);
-  await Database.run(`CREATE TABLE IF NOT EXISTS dedup_cache (
-    fingerprint TEXT NOT NULL,
-    apiKeyId TEXT,
-    status_code INTEGER NOT NULL,
-    body TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    expires_at DATETIME NOT NULL,
-    PRIMARY KEY (fingerprint, COALESCE(apiKeyId, ''))
-  )`);
+  // COALESCE() in a PRIMARY KEY is not valid SQLite syntax; use a surrogate PK
+  // with a unique index instead. The expression form in migration 018 is a
+  // pre-existing bug that only surfaces on a fresh DB.
+  try {
+    await Database.run(`CREATE TABLE IF NOT EXISTS dedup_cache (
+      fingerprint TEXT NOT NULL,
+      apiKeyId TEXT NOT NULL DEFAULT '',
+      status_code INTEGER NOT NULL,
+      body TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      expires_at DATETIME NOT NULL,
+      PRIMARY KEY (fingerprint, apiKeyId)
+    )`);
+  } catch (_) {}
   await Database.run(`CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     senderId INTEGER NOT NULL,
@@ -278,4 +283,19 @@ module.exports = async function createTestTables(Database) {
     strategy  TEXT NOT NULL,
     updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
+
+  // Pre-aggregated donation totals (migration 027)
+  await Database.run(`CREATE TABLE IF NOT EXISTS donation_totals (
+    recipient_id TEXT NOT NULL PRIMARY KEY,
+    total_stroops TEXT NOT NULL DEFAULT '0',
+    donation_count INTEGER NOT NULL DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+  await Database.run(`CREATE TABLE IF NOT EXISTS donation_totals_global (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    total_stroops TEXT NOT NULL DEFAULT '0',
+    donation_count INTEGER NOT NULL DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+  await Database.run(`INSERT OR IGNORE INTO donation_totals_global (id, total_stroops, donation_count) VALUES (1, '0', 0)`);
 };

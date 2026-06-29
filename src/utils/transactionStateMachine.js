@@ -75,6 +75,7 @@ const assertValidTransition = (fromState, toState) => {
 
 module.exports = {
   TRANSACTION_STATES,
+  VALID_TRANSITIONS,
   normalizeState,
   isValidState,
   assertValidState,
