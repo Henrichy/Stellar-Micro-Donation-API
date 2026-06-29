@@ -125,6 +125,43 @@ const recurringDonationsSkippedTotal = new client.Counter({
   registers: [registry],
 });
 
+// ─── Leaderboard Metrics ─────────────────────────────────────────────────────
+
+/**
+ * Counter: leaderboard lookups, labelled by whether they were served from
+ * cache or required a full recomputation.
+ * Labels: result ('hit'|'miss')
+ * @type {client.Counter}
+ */
+const leaderboardCacheLookupsTotal = new client.Counter({
+  name: 'leaderboard_cache_lookups_total',
+  help: 'Total number of leaderboard lookups, labelled by cache hit/miss',
+  labelNames: ['result'],
+  registers: [registry],
+});
+
+/**
+ * Histogram: wall-clock duration of a full leaderboard recomputation
+ * (cache miss only).
+ * @type {client.Histogram}
+ */
+const leaderboardComputeDuration = new client.Histogram({
+  name: 'leaderboard_compute_duration_seconds',
+  help: 'Duration of a full leaderboard recomputation on a cache miss',
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5],
+  registers: [registry],
+});
+
+/** Increment the leaderboard cache-hit counter. */
+function recordLeaderboardCacheHit() {
+  leaderboardCacheLookupsTotal.inc({ result: 'hit' });
+}
+
+/** Increment the leaderboard cache-miss counter. */
+function recordLeaderboardCacheMiss() {
+  leaderboardCacheLookupsTotal.inc({ result: 'miss' });
+}
+
 /**
  * Express middleware that records request duration for every response.
  * Normalises dynamic path segments (e.g. /donations/123 → /donations/:id)
@@ -175,4 +212,9 @@ module.exports = {
   recurringDonationsSuspendedTotal,
   recurringDonationsActiveCount,
   recurringDonationsSkippedTotal,
+  // Leaderboard metrics
+  leaderboardCacheLookupsTotal,
+  leaderboardComputeDuration,
+  recordLeaderboardCacheHit,
+  recordLeaderboardCacheMiss,
 };

@@ -106,7 +106,12 @@ router.get('/donors', checkPermission(PERMISSIONS.STATS_READ), auditLeaderboardA
         period,
         limit,
         totalEntries: leaderboard.length,
-        generatedAt: new Date().toISOString()
+        generatedAt: new Date().toISOString(),
+        // cachedAt reflects when this data was actually computed; the
+        // leaderboard is served from cache for up to LEADERBOARD_CACHE_TTL_MS
+        // after that, so cachedAt may be earlier than generatedAt.
+        cachedAt: leaderboard.cachedAt || null,
+        ttlMs: StatsService.LEADERBOARD_CACHE_TTL_MS,
       }
     });
   } catch (error) {
@@ -142,7 +147,9 @@ router.get('/recipients', checkPermission(PERMISSIONS.STATS_READ), auditLeaderbo
         period,
         limit,
         totalEntries: leaderboard.length,
-        generatedAt: new Date().toISOString()
+        generatedAt: new Date().toISOString(),
+        cachedAt: leaderboard.cachedAt || null,
+        ttlMs: StatsService.LEADERBOARD_CACHE_TTL_MS,
       }
     });
   } catch (error) {
