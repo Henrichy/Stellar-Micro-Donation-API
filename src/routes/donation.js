@@ -197,6 +197,7 @@ const DonationService = require('../services/DonationService');
 const StatsService = require('../services/StatsService');
 const { calculateCostBreakdown } = require('../utils/costBreakdown');
 const LimitService = require('../services/LimitService');
+const { toISOStringUTC } = require('../utils/timestampUtils');
 
 const Transaction = require('../models/transaction');
 const { buildErrorResponse } = require('../utils/validationErrorFormatter');
@@ -1442,7 +1443,7 @@ router.get('/by-campaign/:campaignId', checkPermission(PERMISSIONS.DONATIONS_REA
       id: tx.id,
       amount: tx.amount,
       donorPublicKey: tx.anonymous ? null : tx.donorPublicKey,
-      timestamp: tx.timestamp,
+      timestamp: toISOStringUTC(tx.timestamp),
       status: tx.status,
       transactionHash: tx.transactionHash,
       tags: tx.tags ? JSON.parse(tx.tags) : [],
@@ -2083,7 +2084,7 @@ router.get('/:id/timeline', checkPermission(PERMISSIONS.DONATIONS_READ), donatio
 
     // Event 1: Donation created
     timeline.push({
-      timestamp: donation.timestamp,
+      timestamp: toISOStringUTC(donation.timestamp),
       event: 'created',
       details: {
         amount: donation.amount,
@@ -2105,25 +2106,25 @@ router.get('/:id/timeline', checkPermission(PERMISSIONS.DONATIONS_READ), donatio
       for (const log of auditLogs) {
         if (log.action === 'DONATION_SUBMITTED') {
           timeline.push({
-            timestamp: log.created_at,
+            timestamp: toISOStringUTC(log.created_at),
             event: 'submitted',
             details: log.details || {}
           });
         } else if (log.action === 'DONATION_CONFIRMED') {
           timeline.push({
-            timestamp: log.created_at,
+            timestamp: toISOStringUTC(log.created_at),
             event: 'confirmed',
             details: log.details || {}
           });
         } else if (log.action === 'DONATION_FAILED') {
           timeline.push({
-            timestamp: log.created_at,
+            timestamp: toISOStringUTC(log.created_at),
             event: 'failed',
             details: log.details || {}
           });
         } else if (log.action === 'DONATION_STATUS_CHANGED') {
           timeline.push({
-            timestamp: log.created_at,
+            timestamp: toISOStringUTC(log.created_at),
             event: 'status_changed',
             details: log.details || {}
           });
@@ -2144,7 +2145,7 @@ router.get('/:id/timeline', checkPermission(PERMISSIONS.DONATIONS_READ), donatio
 
       for (const refund of refunds) {
         timeline.push({
-          timestamp: refund.created_at,
+          timestamp: toISOStringUTC(refund.created_at),
           event: 'refunded',
           details: {
             refund_id: refund.id,
@@ -2171,7 +2172,7 @@ router.get('/:id/timeline', checkPermission(PERMISSIONS.DONATIONS_READ), donatio
 
       for (const match of matchingDonations) {
         timeline.push({
-          timestamp: match.created_at,
+          timestamp: toISOStringUTC(match.created_at),
           event: 'matched',
           details: {
             matching_program_id: match.matching_program_id,
