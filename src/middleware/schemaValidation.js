@@ -265,6 +265,9 @@ function validateSchema(schemaOrKey, versions, options) {
       versionInfo = schemaRegistry.getSchema(schemaKey, requestedVersion);
 
       if (!versionInfo) {
+        // 400 Bad Request: the client specified a schema version string that does
+        // not exist. This is a malformed request (wrong header value), not a
+        // semantic validation failure, so 400 is correct here.
         return res.status(400).json({
           success: false,
           error: {
@@ -323,7 +326,10 @@ function validateSchema(schemaOrKey, versions, options) {
         success: false,
         error: {
           code: ERROR_CODES.VALIDATION_ERROR.code,
-          message: 'Schema validation failed',
+          // 422 Unprocessable Entity: request was well-formed JSON but failed
+          // semantic validation rules (missing fields, bad values, etc.).
+          // 400 is reserved for syntactically malformed requests.
+          message: 'Request body failed schema validation',
           details: allErrors,
           requestId: req.id,
           timestamp: new Date().toISOString(),
@@ -335,7 +341,7 @@ function validateSchema(schemaOrKey, versions, options) {
         errorResponse.error.migrationGuide = versionInfo.migrationGuide;
       }
 
-      return res.status(400).json(errorResponse);
+      return res.status(422).json(errorResponse);
     }
 
     return next();

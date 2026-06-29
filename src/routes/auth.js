@@ -132,9 +132,12 @@ router.post('/refresh', bruteForce.middleware(), authRefreshRateLimiter, payload
  */
 router.get('/challenge', asyncHandler(async (req, res) => {
   if (!sep10Service) {
-    return res.status(501).json({
+    // 503: the endpoint is defined but the feature is disabled on this instance
+    // (missing SERVICE_SECRET_KEY). 501 would mean the server never intends to
+    // implement this; 503 correctly signals "unavailable right now / not configured".
+    return res.status(503).json({
       success: false,
-      error: { code: 'SEP10_NOT_CONFIGURED', message: 'SEP-0010 authentication is not available' },
+      error: { code: 'SEP10_NOT_CONFIGURED', message: 'SEP-0010 authentication is not available on this server' },
     });
   }
 
@@ -162,9 +165,10 @@ router.get('/challenge', asyncHandler(async (req, res) => {
  */
 router.post('/token', bruteForce.middleware(), authTokenRateLimiter, payloadSizeLimiter(ENDPOINT_LIMITS.auth), asyncHandler(async (req, res) => {
   if (!sep10Service) {
-    return res.status(501).json({
+    // 503: feature disabled by configuration, not permanently unimplemented
+    return res.status(503).json({
       success: false,
-      error: { code: 'SEP10_NOT_CONFIGURED', message: 'SEP-0010 authentication is not available' },
+      error: { code: 'SEP10_NOT_CONFIGURED', message: 'SEP-0010 authentication is not available on this server' },
     });
   }
 

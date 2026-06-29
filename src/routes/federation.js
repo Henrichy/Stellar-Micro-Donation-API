@@ -79,8 +79,11 @@ router.get('/federation', (req, res) => {
   }
 
   if (type !== 'name') {
-    return res.status(501).json({
-      detail: `Federation lookup type "${type}" is not supported. Only "name" is supported.`,
+    // 400: the client sent an unsupported value for the 'type' parameter.
+    // 501 would imply the server never intends to handle it; 400 is correct
+    // because the fault is the client providing an unknown lookup type.
+    return res.status(400).json({
+      detail: `Unsupported federation lookup type "${type}". Only "name" is supported.`,
     });
   }
 
