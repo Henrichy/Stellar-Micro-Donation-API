@@ -27,7 +27,7 @@ const { metricsMiddleware, registry } = require('../utils/metrics');
 const { createDeduplicationMiddleware } = require('../middleware/deduplication');
 const { fieldFilterMiddleware } = require('../middleware/fieldFilter');
 const { requestTimeout, TIMEOUTS } = require('../middleware/requestTimeout');
-const apiVersionMiddleware = require('../middleware/apiVersion');
+const schemaVersionMiddleware = require('../middleware/schemaVersion');
 const requireApiKey = require('../middleware/apiKey');
 const { validatePayloadFields } = require('../middleware/validation');
 const asyncHandler = require('../utils/asyncHandler');
@@ -158,7 +158,10 @@ function applyMiddleware(app) {
   app.use(validatePayloadFields);
 
   // ─── Schema version negotiation ──────────────────────────────────────────────
-  app.use(apiVersionMiddleware);
+  // Normalises the X-Schema-Version header into req.schemaVersion (semver string).
+  // URL path (/api/v1) remains the sole authority for API surface versioning.
+  // See src/middleware/schemaVersion.js for the full versioning contract.
+  app.use(schemaVersionMiddleware);
 }
 
 module.exports = { applyMiddleware };

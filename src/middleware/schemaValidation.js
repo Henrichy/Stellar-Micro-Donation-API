@@ -258,7 +258,10 @@ function validateSchema(schemaOrKey, versions, options) {
     let versionInfo = null;
 
     if (schemaKey) {
-      const requestedVersion = req.get('X-Schema-Version');
+      // Use the normalised semver string attached by schemaVersionMiddleware.
+      // Falls back to the raw header only when the middleware was not applied
+      // (e.g. in isolated unit tests that skip the middleware stack).
+      const requestedVersion = req.schemaVersion || req.get('X-Schema-Version') || null;
       versionInfo = schemaRegistry.getSchema(schemaKey, requestedVersion);
 
       if (!versionInfo) {

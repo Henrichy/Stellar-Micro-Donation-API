@@ -44,9 +44,12 @@ const options = {
         },
         XSchemaVersion: {
           description:
-            'Request body schema version. Specify the schema version for request body validation. ' +
-            'Defaults to version 1 if not provided. Supported versions are listed in the X-Schema-Version-Supported response header. ' +
-            'Use this header to maintain backward compatibility when the API evolves.',
+            'Request-body schema variant. Accepted values are full semver strings (e.g. "1.0.0", "2.0.0"). ' +
+            'An integer shorthand (e.g. "1") is also accepted and is normalised to "1.0.0" for backward compatibility. ' +
+            'Omitting this header selects the latest stable schema for the endpoint. ' +
+            'Supported versions for a given endpoint are listed in the X-Schema-Version-Supported response header. ' +
+            'NOTE: this header governs the request-body schema only — it is independent of the URL API version ' +
+            '(/api/v1). The URL version changes only on breaking (MAJOR) API releases.',
           schema: { type: 'string', example: '1.0.0' },
         },
       },
