@@ -1,42 +1,66 @@
 /**
  * Fee Calculator Utility
- * Calculates optional analytics fees for donations
- * Note: Fees are calculated but NOT deducted on-chain
+ *
+ * All arithmetic is done in integer stroops via the money utility.
+ * Rounding: floor (BigInt division truncates toward zero) — platform's favor.
+ *
+ * Fee rates are in basis points (1 bps = 0.01%).
+ *   DEFAULT_FEE_BPS  = 200  → 2 %
+ *   MAX_FEE_BPS      = 500  → 5 %
+ *   MIN_FEE_STROOPS  = 100_000  → 0.01 XLM
  */
 
-const DEFAULT_FEE_PERCENTAGE = 0.02; // 2% default fee
-const MIN_FEE = 0.01; // Minimum fee amount
-const MAX_FEE_PERCENTAGE = 0.05; // Maximum 5% fee cap
+const { toStroops, fromStroops, calcFee } = require('./money');
+
+const DEFAULT_FEE_BPS = 200n;   // 2 %
+const MAX_FEE_BPS = 500n;        // 5 %
+const MIN_FEE_STROOPS = 100_000n; // 0.01 XLM
 
 /**
- * Calculate analytics fee for a donation
- * @param {number} amount - The donation amount
- * @param {number} feePercentage - Optional custom fee percentage (default: 2%)
- * @returns {Object} Fee calculation details
+ * Calculate analytics fee for a donation.
+ * Accepts an XLM string or number; returns amounts as XLM display strings plus
+ * the raw BigInt stroop values for internal use.
+ *
+ * @param {string|number} amount - Donation amount in XLM
+ * @param {bigint|number} [feeBps=DEFAULT_FEE_BPS] - Fee rate in basis points
+ * @returns {{
+ *   fee: string,
+ *   feeStroops: bigint,
+ *   feePercentage: number,
+ *   originalAmount: string,
+ *   totalWithFee: string
+ * }}
  */
-function calculateAnalyticsFee(amount, feePercentage = DEFAULT_FEE_PERCENTAGE) {
-  if (typeof amount !== 'number' || amount <= 0) {
-    throw new Error('Amount must be a positive number');
+function calculateAnalyticsFee(amount, feeBps = DEFAULT_FEE_BPS) {
+  const bps = BigInt(feeBps);
+  if (bps < 0n || bps > MAX_FEE_BPS) {
+    throw new Error(`Fee bps must be between 0 and ${MAX_FEE_BPS} (${Number(MAX_FEE_BPS) / 100}%)`);
   }
 
-  if (feePercentage < 0 || feePercentage > MAX_FEE_PERCENTAGE) {
-    throw new Error(`Fee percentage must be between 0 and ${MAX_FEE_PERCENTAGE * 100}%`);
+  const amountStroops = toStroops(amount);
+  if (amountStroops <= 0n) {
+    throw new Error('Amount must be a positive value');
   }
 
-  const calculatedFee = amount * feePercentage;
-  const fee = Math.max(calculatedFee, MIN_FEE);
+  const feeStroops = calcFee(amountStroops, bps, { minFeeStroops: MIN_FEE_STROOPS });
+  const totalStroops = amountStroops + feeStroops;
 
   return {
-    fee: parseFloat(fee.toFixed(2)),
-    feePercentage: feePercentage,
-    originalAmount: amount,
-    totalWithFee: parseFloat((amount + fee).toFixed(2))
+    fee: fromStroops(feeStroops),
+    feeStroops,
+    feePercentage: Number(bps) / 100,
+    originalAmount: fromStroops(amountStroops),
+    totalWithFee: fromStroops(totalStroops),
   };
 }
 
 module.exports = {
   calculateAnalyticsFee,
-  DEFAULT_FEE_PERCENTAGE,
-  MIN_FEE,
-  MAX_FEE_PERCENTAGE
+  DEFAULT_FEE_BPS,
+  MIN_FEE_STROOPS,
+  MAX_FEE_BPS,
+  // Legacy float-equivalent constants for callers that only need the numeric value
+  DEFAULT_FEE_PERCENTAGE: Number(DEFAULT_FEE_BPS) / 10000,
+  MIN_FEE: Number(MIN_FEE_STROOPS) / 10_000_000,
+  MAX_FEE_PERCENTAGE: Number(MAX_FEE_BPS) / 10000,
 };

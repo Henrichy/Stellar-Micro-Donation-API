@@ -11,6 +11,7 @@
 
 const Transaction = require('../models/transaction');
 const { generatePseudonymousId, isPseudonymousId } = require('../utils/anonymization');
+const { toStroops, fromStroops, addStroops } = require('../utils/money');
 
 class StatsService {
   /**
@@ -55,14 +56,14 @@ class StatsService {
       if (!dailyMap.has(dateKey)) {
         dailyMap.set(dateKey, {
           date: dateKey,
-          totalVolume: 0,
+          _totalVolumeStroops: 0n,
           transactionCount: 0,
           transactions: []
         });
       }
 
       const dayStats = dailyMap.get(dateKey);
-      dayStats.totalVolume += parseFloat(tx.amount) || 0;
+      dayStats._totalVolumeStroops = addStroops(dayStats._totalVolumeStroops, toStroops(tx.amount || 0));
       dayStats.transactionCount += 1;
       dayStats.transactions.push({
         id: tx.id,
@@ -73,9 +74,12 @@ class StatsService {
       });
     });
 
-    return Array.from(dailyMap.values()).sort((a, b) => 
-      new Date(a.date) - new Date(b.date)
-    );
+    return Array.from(dailyMap.values())
+      .sort((a, b) => new Date(a.date) - new Date(b.date))
+      .map(d => {
+        const { _totalVolumeStroops, ...rest } = d;
+        return { ...rest, totalVolume: fromStroops(_totalVolumeStroops) };
+      });
   }
 
   /**
@@ -100,14 +104,14 @@ class StatsService {
           year: weekKey.year,
           weekStart: weekKey.weekStart,
           weekEnd: weekKey.weekEnd,
-          totalVolume: 0,
+          _totalVolumeStroops: 0n,
           transactionCount: 0,
           transactions: []
         });
       }
 
       const weekStats = weeklyMap.get(mapKey);
-      weekStats.totalVolume += parseFloat(tx.amount) || 0;
+      weekStats._totalVolumeStroops = addStroops(weekStats._totalVolumeStroops, toStroops(tx.amount || 0));
       weekStats.transactionCount += 1;
       weekStats.transactions.push({
         id: tx.id,
@@ -118,10 +122,15 @@ class StatsService {
       });
     });
 
-    return Array.from(weeklyMap.values()).sort((a, b) => {
-      if (a.year !== b.year) return a.year - b.year;
-      return a.week - b.week;
-    });
+    return Array.from(weeklyMap.values())
+      .sort((a, b) => {
+        if (a.year !== b.year) return a.year - b.year;
+        return a.week - b.week;
+      })
+      .map(w => {
+        const { _totalVolumeStroops, ...rest } = w;
+        return { ...rest, totalVolume: fromStroops(_totalVolumeStroops) };
+      });
   }
 
   /**
@@ -134,11 +143,11 @@ class StatsService {
     const transactions = Transaction.getByDateRange(startDate, endDate);
     
     const summary = {
-      totalVolume: 0,
+      totalVolume: '0.0000000',
       totalTransactions: transactions.length,
-      averageTransactionAmount: 0,
-      maxTransactionAmount: 0,
-      minTransactionAmount: Infinity,
+      averageTransactionAmount: '0.0000000',
+      maxTransactionAmount: '0.0000000',
+      minTransactionAmount: '0.0000000',
       dateRange: {
         start: startDate.toISOString(),
         end: endDate.toISOString()
@@ -146,18 +155,25 @@ class StatsService {
     };
 
     if (transactions.length === 0) {
-      summary.minTransactionAmount = 0;
       return summary;
     }
 
+    let totalStroops = 0n;
+    let maxStroops = 0n;
+    let minStroops = null;
+
     transactions.forEach(tx => {
-      const amount = parseFloat(tx.amount) || 0;
-      summary.totalVolume += amount;
-      summary.maxTransactionAmount = Math.max(summary.maxTransactionAmount, amount);
-      summary.minTransactionAmount = Math.min(summary.minTransactionAmount, amount);
+      const s = toStroops(tx.amount || 0);
+      totalStroops += s;
+      if (s > maxStroops) maxStroops = s;
+      if (minStroops === null || s < minStroops) minStroops = s;
     });
 
-    summary.averageTransactionAmount = summary.totalVolume / transactions.length;
+    summary.totalVolume = fromStroops(totalStroops);
+    summary.maxTransactionAmount = fromStroops(maxStroops);
+    summary.minTransactionAmount = fromStroops(minStroops ?? 0n);
+    // average: integer division (floor)
+    summary.averageTransactionAmount = fromStroops(totalStroops / BigInt(transactions.length));
 
     return summary;
   }
@@ -182,14 +198,14 @@ class StatsService {
       if (!donorMap.has(donor)) {
         donorMap.set(donor, {
           donor,
-          totalDonated: 0,
+          _totalDonatedStroops: 0n,
           donationCount: 0,
           donations: []
         });
       }
 
       const donorStats = donorMap.get(donor);
-      donorStats.totalDonated += parseFloat(tx.amount) || 0;
+      donorStats._totalDonatedStroops = addStroops(donorStats._totalDonatedStroops, toStroops(tx.amount || 0));
       donorStats.donationCount += 1;
       donorStats.donations.push({
         id: tx.id,
@@ -199,9 +215,17 @@ class StatsService {
       });
     });
 
-    return Array.from(donorMap.values()).sort((a, b) => 
-      b.totalDonated - a.totalDonated
-    );
+    return Array.from(donorMap.values())
+      .map(d => {
+        const { _totalDonatedStroops, ...rest } = d;
+        return { ...rest, totalDonated: fromStroops(_totalDonatedStroops) };
+      })
+      .sort((a, b) => {
+        // sort descending by stroop value (compare as strings of equal-length wouldn't work; re-parse)
+        const aS = toStroops(a.totalDonated);
+        const bS = toStroops(b.totalDonated);
+        return bS > aS ? 1 : bS < aS ? -1 : 0;
+      });
   }
 
   /**
@@ -221,14 +245,14 @@ class StatsService {
       if (!recipientMap.has(recipient)) {
         recipientMap.set(recipient, {
           recipient,
-          totalReceived: 0,
+          _totalReceivedStroops: 0n,
           donationCount: 0,
           donations: []
         });
       }
 
       const recipientStats = recipientMap.get(recipient);
-      recipientStats.totalReceived += parseFloat(tx.amount) || 0;
+      recipientStats._totalReceivedStroops = addStroops(recipientStats._totalReceivedStroops, toStroops(tx.amount || 0));
       recipientStats.donationCount += 1;
       recipientStats.donations.push({
         id: tx.id,
@@ -238,9 +262,16 @@ class StatsService {
       });
     });
 
-    return Array.from(recipientMap.values()).sort((a, b) => 
-      b.totalReceived - a.totalReceived
-    );
+    return Array.from(recipientMap.values())
+      .map(r => {
+        const { _totalReceivedStroops, ...rest } = r;
+        return { ...rest, totalReceived: fromStroops(_totalReceivedStroops) };
+      })
+      .sort((a, b) => {
+        const aS = toStroops(a.totalReceived);
+        const bS = toStroops(b.totalReceived);
+        return bS > aS ? 1 : bS < aS ? -1 : 0;
+      });
   }
 
   /**
@@ -336,42 +367,54 @@ class StatsService {
    */
   static getAnalyticsFeeStats(startDate, endDate) {
     const transactions = Transaction.getByDateRange(startDate, endDate);
-
     const byAsset = {};
+
+    let totalFeeStroops = 0n;
+    let totalVolumeStroops = 0n;
 
     transactions.forEach(tx => {
       const asset = tx.asset || tx.assetCode || 'XLM';
-      const amount = parseFloat(tx.amount) || 0;
-      const fee = parseFloat(tx.analyticsFee) || 0;
+      const amountStroops = toStroops(tx.amount || 0);
+      const feeStroops = toStroops(tx.analyticsFee || 0);
       const xlmRate = parseFloat(tx.xlmRate) || (asset === 'XLM' ? 1 : 0);
 
       if (!byAsset[asset]) {
         byAsset[asset] = {
           asset,
-          totalFees: 0,
-          totalVolume: 0,
+          _totalFeesStroops: 0n,
+          _totalVolumeStroops: 0n,
+          _totalFeesInXLMStroops: 0n,
           transactionCount: 0,
-          totalFeesInXLM: 0,
         };
       }
 
-      byAsset[asset].totalFees += fee;
-      byAsset[asset].totalVolume += amount;
+      byAsset[asset]._totalFeesStroops += feeStroops;
+      byAsset[asset]._totalVolumeStroops += amountStroops;
       byAsset[asset].transactionCount += 1;
-      byAsset[asset].totalFeesInXLM += asset === 'XLM' ? fee : fee * xlmRate;
+      // For non-XLM, convert fee to XLM stroops using stored rate
+      const feeInXLMStroops = asset === 'XLM' ? feeStroops : BigInt(Math.floor(Number(feeStroops) * xlmRate));
+      byAsset[asset]._totalFeesInXLMStroops += feeInXLMStroops;
+
+      totalFeeStroops += feeInXLMStroops;
+      totalVolumeStroops += asset === 'XLM' ? amountStroops : 0n;
     });
 
-    const feesByAsset = Object.values(byAsset).map(a => ({
-      ...a,
-      totalFees: +a.totalFees.toFixed(7),
-      totalVolume: +a.totalVolume.toFixed(7),
-      totalFeesInXLM: +a.totalFeesInXLM.toFixed(7),
-      effectiveFeePercentage: a.totalVolume > 0
-        ? +((a.totalFees / a.totalVolume) * 100).toFixed(4)
-        : 0,
-    }));
+    const feesByAsset = Object.values(byAsset).map(a => {
+      const { _totalFeesStroops, _totalVolumeStroops, _totalFeesInXLMStroops, ...rest } = a;
+      const volStroops = _totalVolumeStroops;
+      return {
+        ...rest,
+        totalFees: fromStroops(_totalFeesStroops),
+        totalVolume: fromStroops(_totalVolumeStroops),
+        totalFeesInXLM: fromStroops(_totalFeesInXLMStroops),
+        effectiveFeePercentage: volStroops > 0n
+          ? Number(_totalFeesStroops * 10000n / volStroops) / 100
+          : 0,
+      };
+    });
 
-    const totalInXLM = +feesByAsset.reduce((s, a) => s + a.totalFeesInXLM, 0).toFixed(7);
+    const totalInXLMStroops = feesByAsset.reduce((s, a) => s + toStroops(a.totalFeesInXLM), 0n);
+    const totalInXLM = fromStroops(totalInXLMStroops);
     const totalTransactions = transactions.length;
     const _totalFeesXLM = feesByAsset.find(a => a.asset === 'XLM');
 
@@ -380,8 +423,8 @@ class StatsService {
       totalInXLM,
       transactionCount: totalTransactions,
       averageFeePerTransactionXLM: totalTransactions > 0
-        ? +(totalInXLM / totalTransactions).toFixed(7)
-        : 0,
+        ? fromStroops(totalInXLMStroops / BigInt(totalTransactions))
+        : '0.0000000',
       dateRange: {
         start: startDate.toISOString(),
         end: endDate.toISOString(),
@@ -408,8 +451,8 @@ class StatsService {
 
     const analytics = {
       walletAddress,
-      totalSent: 0,
-      totalReceived: 0,
+      totalSent: '0.0000000',
+      totalReceived: '0.0000000',
       donationCount: 0,
       sentCount: 0,
       receivedCount: 0,
@@ -426,12 +469,14 @@ class StatsService {
       analytics.dateRange = 'lifetime';
     }
 
-    transactions.forEach(tx => {
-      const amount = parseFloat(tx.amount) || 0;
+    let sentStroops = 0n;
+    let receivedStroops = 0n;
 
-      // Check if wallet is the donor (sender)
+    transactions.forEach(tx => {
+      const s = toStroops(tx.amount || 0);
+
       if (tx.donor === walletAddress) {
-        analytics.totalSent += amount;
+        sentStroops += s;
         analytics.sentCount += 1;
         analytics.sentTransactions.push({
           id: tx.id,
@@ -442,9 +487,8 @@ class StatsService {
         });
       }
 
-      // Check if wallet is the recipient (receiver)
       if (tx.recipient === walletAddress) {
-        analytics.totalReceived += amount;
+        receivedStroops += s;
         analytics.receivedCount += 1;
         analytics.receivedTransactions.push({
           id: tx.id,
@@ -456,7 +500,8 @@ class StatsService {
       }
     });
 
-    // Total donation count is the sum of sent and received
+    analytics.totalSent = fromStroops(sentStroops);
+    analytics.totalReceived = fromStroops(receivedStroops);
     analytics.donationCount = analytics.sentCount + analytics.receivedCount;
 
     return analytics;

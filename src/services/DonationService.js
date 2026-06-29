@@ -361,7 +361,7 @@ class DonationService {
     // Record in JSON with state transitions
     const transaction = Transaction.create({
       id: dbResult.id.toString(),
-      amount: parseFloat(amount),
+      amount: amount,
       donor: sender.publicKey,
       recipient: receiver.publicKey,
       status: TRANSACTION_STATES.PENDING,

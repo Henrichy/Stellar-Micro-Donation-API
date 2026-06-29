@@ -148,6 +148,25 @@ function errorHandler(err, req, res, next) {
     return res.status(err.statusCode).json(errorBody);
   }
 
+  // #1146: pool exhaustion → fast 503 with Retry-After so clients back off
+  if (
+    err.name === 'DatabaseError' &&
+    err.message &&
+    err.message.includes('Timed out waiting for an available database connection')
+  ) {
+    log.warn('ERROR_HANDLER', 'DB pool exhaustion', { requestId: req.id });
+    res.set('Retry-After', '5');
+    return res.status(503).json({
+      success: false,
+      error: {
+        code: 'SERVICE_UNAVAILABLE',
+        message: 'Server is temporarily overloaded. Please retry after a moment.',
+        requestId: req.id,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+
   // Handle named validation errors
   if (err.name === "ValidationError" || err.name === "SchemaValidationError") {
     return res.status(400).json({
