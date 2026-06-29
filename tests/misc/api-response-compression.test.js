@@ -275,4 +275,30 @@ describe('Compression middleware — configurable level', () => {
       server.close();
     }
   });
+
+  test('throws for level outside 0–11', () => {
+    expect(() => createCompressionMiddleware({ level: 12 })).toThrow('COMPRESSION_LEVEL');
+    expect(() => createCompressionMiddleware({ level: -1 })).toThrow('COMPRESSION_LEVEL');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integration tests — x-gzip skip
+// ---------------------------------------------------------------------------
+describe('Compression middleware — skip application/x-gzip', () => {
+  test('does not re-compress x-gzip content', async () => {
+    const app = express();
+    app.use(createCompressionMiddleware({ threshold: 1 }));
+    app.get('/export', (req, res) => {
+      res.setHeader('Content-Type', 'application/x-gzip');
+      res.json({ data: 'x'.repeat(2048) });
+    });
+    const server = app.listen(0);
+    try {
+      const res = await rawGet(server, '/export', { 'Accept-Encoding': 'gzip' });
+      expect(res.headers['content-encoding']).toBeUndefined();
+    } finally {
+      server.close();
+    }
+  });
 });
