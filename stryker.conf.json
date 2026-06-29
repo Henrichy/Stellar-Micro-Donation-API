@@ -1,0 +1,55 @@
+{
+  "testRunner": "jest",
+  "testFramework": "jest",
+  "coverageAnalysis": "perTest",
+  "mutate": [
+    "src/services/DonationService.js",
+    "src/routes/donation.js",
+    "src/lib/transactionStateMachine.js",
+    "src/lib/validators.js",
+    "src/lib/moneyMath.js"
+  ],
+  "mutators": [
+    "ArithmeticOperator",
+    "ArrayLiteral",
+    "BlockStatement",
+    "BooleanLiteral",
+    "ConditionalBoundary",
+    "ConditionalExpression",
+    "EqualityOperator",
+    "LogicalOperator",
+    "RegExp",
+    "RemoveConditionals",
+    "RemoveConditionalsBoundary",
+    "UnaryOperator",
+    "UpdateOperator"
+  ],
+  "reporters": [
+    "progress",
+    "html",
+    "json"
+  ],
+  "logLevel": "info",
+  "thresholds": {
+    "high": 80,
+    "medium": 60,
+    "low": 40
+  },
+  "plugins": [
+    "@stryker-mutator/core"
+  ],
+  "jest": {
+    "projectType": "custom",
+    "configFile": "jest.config.js"
+  },
+  "timeoutMS": 30000,
+  "tempDirName": ".stryker-tmp",
+  "cleanTempDir": true,
+  "ignorePatterns": [
+    "node_modules",
+    "coverage",
+    ".git",
+    "dist",
+    "build"
+  ]
+}
