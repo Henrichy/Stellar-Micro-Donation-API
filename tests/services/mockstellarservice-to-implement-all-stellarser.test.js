@@ -93,6 +93,9 @@ describe('MockStellarService interface compliance', () => {
     expect(tx1.transactionId).toBe(donation.transactionId);
 
     await expect(service.getTransaction('does_not_exist')).rejects.toThrow('Transaction not found');
+  });
+});
+
 /**
  * Bug Condition Exploration Test — Property 1
  *
@@ -105,7 +108,6 @@ describe('MockStellarService interface compliance', () => {
  * DO NOT fix the code when this test fails — the failure is the expected outcome.
  */
 
-const MockStellarService = require('../../src/services/MockStellarService');
 
 // A valid 56-char Stellar public key (G + 55 base32 chars A-Z,2-7 only)
 const KNOWN_PUBLIC_KEY = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW';
