@@ -20,7 +20,8 @@ const perKeyRateLimit = async (req, res, next) => {
   const windowSeconds = keyInfo.rateLimitWindowSeconds || DEFAULT_WINDOW_SECONDS;
 
   const result = await getStore().incrementAndCheck(keyInfo.id, limit, windowSeconds);
-  res.set(buildRateLimitHeaders(limit, result.remaining, result.resetAt));
+  // result.resetAt is in milliseconds; convert to seconds for the header contract
+  res.set(buildRateLimitHeaders(limit, result.remaining, Math.ceil(result.resetAt / 1000)));
 
   if (!result.allowed) {
     const retryAfter = calculateRetryAfter(result.resetAt);
