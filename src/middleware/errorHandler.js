@@ -167,9 +167,11 @@ function errorHandler(err, req, res, next) {
     });
   }
 
-  // Handle named validation errors
+  // Handle named validation errors — 422 Unprocessable Entity:
+  // The request was well-formed (parseable) but failed semantic validation rules.
+  // 400 Bad Request is reserved for syntactically malformed requests (e.g. invalid JSON).
   if (err.name === "ValidationError" || err.name === "SchemaValidationError") {
-    return res.status(400).json({
+    return res.status(422).json({
       success: false,
       error: {
         code: ERROR_CODES.VALIDATION_ERROR.code,

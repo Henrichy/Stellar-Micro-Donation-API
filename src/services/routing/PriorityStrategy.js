@@ -2,9 +2,11 @@
  * PriorityStrategy
  *
  * Selects the recipient with the highest `priority` value (numeric, higher = more urgent).
- * Defaults to 0 if absent. Tiebreaks by lexicographically smallest id.
+ * Defaults to DEFAULT_RECIPIENT_PRIORITY if absent. Tiebreaks by lexicographically smallest id.
  * All pool members are eligible.
  */
+
+const { DEFAULT_RECIPIENT_PRIORITY } = require('../../constants');
 
 class PriorityStrategy {
   /**
@@ -17,7 +19,7 @@ class PriorityStrategy {
     let selectedId = null;
 
     for (const recipient of pool) {
-      const p = typeof recipient.priority === 'number' ? recipient.priority : 0;
+      const p = typeof recipient.priority === 'number' ? recipient.priority : DEFAULT_RECIPIENT_PRIORITY;
       if (p > maxPriority || (p === maxPriority && recipient.id < selectedId)) {
         maxPriority = p;
         selectedId = recipient.id;

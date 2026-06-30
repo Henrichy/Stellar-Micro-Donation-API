@@ -11,7 +11,17 @@
 
 require('dotenv').config({ path: require('path').join(__dirname, '../../.env') });
 const path = require('path');
-const { VALID_STELLAR_NETWORKS } = require('../constants');
+const {
+  VALID_STELLAR_NETWORKS,
+  MS_PER_MINUTE,
+  DEFAULT_API_KEY_EXPIRY_WARN_DAYS,
+  DEFAULT_API_KEY_EXPIRED_WINDOW_DAYS,
+  DEFAULT_API_KEY_HEADER_WINDOW_DAYS,
+  DEFAULT_WEBHOOK_TIMEOUT_MS,
+  DEFAULT_TX_SYNC_INTERVAL_MS,
+  DEFAULT_RETENTION_DAYS,
+  DEFAULT_RETENTION_SCHEDULE,
+} = require('../constants');
 const { getActiveEnvironment } = require('./stellarEnvironments');
 
 /**
@@ -288,13 +298,6 @@ const buildConfig = (env, isProduction, isTest) => {
     path: process.env.DB_PATH || './donations.db',
   };
 
-  // API Keys configuration
-  const apiKeys = {
-    legacy: process.env.API_KEYS 
-      ? process.env.API_KEYS.split(',').map(key => key.trim()).filter(Boolean)
-      : [],
-  };
-
   // Rate limiting configuration
   const rateLimit = {
     maxRequests: parseInteger(process.env.RATE_LIMIT_MAX_REQUESTS, 100, 1, null, 'RATE_LIMIT_MAX_REQUESTS'),
@@ -308,6 +311,104 @@ const buildConfig = (env, isProduction, isTest) => {
     maxAmount: parseFloat(process.env.MAX_DONATION_AMOUNT, 10000, 0, null, 'MAX_DONATION_AMOUNT'),
     maxDailyPerDonor: parseFloat(process.env.MAX_DAILY_DONATION_PER_DONOR, 0, 0, null, 'MAX_DAILY_DONATION_PER_DONOR'),
     refundEligibilityWindowDays: parseInteger(process.env.REFUND_ELIGIBILITY_WINDOW_DAYS, 30, 1, null, 'REFUND_ELIGIBILITY_WINDOW_DAYS'),
+  };
+
+  // Fees configuration — single source of truth for fee defaults.
+  // Hot-path magic numbers previously lived inline in src/routes/fees.js.
+  // Bounds are intentionally loose for `platformPercent` because some operators
+  // use >100% values to mean "100% of the donation goes to the platform". Re-add
+  // a hard upper bound if your business rules specifically forbid this.
+  const fees = {
+    platformPercent: parseFloat(process.env.PLATFORM_FEE_PERCENT, 1.5, 0, null, 'PLATFORM_FEE_PERCENT'),
+    minXLM: parseFloat(process.env.MINIMUM_FEE_XLM, 0.01, 0, null, 'MINIMUM_FEE_XLM'),
+    maxXLM: parseFloat(process.env.MAXIMUM_FEE_XLM, 10.0, 0, null, 'MAXIMUM_FEE_XLM'),
+  };
+
+  // Retention configuration — unified defaults for all three retention categories.
+  // Defaults are sourced from src/constants/domain.js (single definition per concern).
+  // NOTE: RetentionService's audit-log deletion path (RETENTION_AUDIT_LOGS_DAYS) and
+  // AuditLogRetentionService's archive-and-delete path (AUDIT_LOG_RETENTION_DAYS)
+  // are kept as two SEPARATE slots because they have different default periods and
+  // different operational semantics (compliance archival vs hot-table purge).
+  const retention = {
+    donationsDays: parseInteger(
+      process.env.RETENTION_DONATIONS_DAYS,
+      DEFAULT_RETENTION_DAYS.DONATIONS,
+      0, null, 'RETENTION_DONATIONS_DAYS'
+    ),
+    auditLogsDays: parseInteger(
+      process.env.RETENTION_AUDIT_LOGS_DAYS,
+      DEFAULT_RETENTION_DAYS.AUDIT_LOGS_DELETION,
+      0, null, 'RETENTION_AUDIT_LOGS_DAYS'
+    ),
+    idempotencyDays: parseInteger(
+      process.env.RETENTION_IDEMPOTENCY_DAYS,
+      DEFAULT_RETENTION_DAYS.IDEMPOTENCY_KEYS,
+      0, null, 'RETENTION_IDEMPOTENCY_DAYS'
+    ),
+    scheduleCron: process.env.RETENTION_SCHEDULE_CRON || DEFAULT_RETENTION_SCHEDULE,
+  };
+
+  // Audit log archive retention — used by AuditLogRetentionService whose job is to
+  // archive entries older than this and then remove them from the live audit_logs
+  // table. Independent from `retention.auditLogsDays` so an operator can shorten
+  // the archive window without affecting the referenced time window elsewhere.
+  const auditRetention = {
+    archiveAfterDays: parseInteger(
+      process.env.AUDIT_LOG_RETENTION_DAYS,
+      DEFAULT_RETENTION_DAYS.AUDIT_LOGS_ARCHIVE,
+      0, null, 'AUDIT_LOG_RETENTION_DAYS'
+    ),
+  };
+
+  // API-key expiry notification configuration.
+  // PARSE_API_KEY_EXPIRY_WARN_DAYS accepts a comma-separated list (e.g. "30,7,1").
+  const parseApiKeyExpiryWarnDays = () => {
+    const raw = process.env.API_KEY_EXPIRY_WARN_DAYS;
+    if (!raw) return DEFAULT_API_KEY_EXPIRY_WARN_DAYS;
+    return raw.split(',')
+      .map((s) => parseInt(s.trim(), 10))
+      .filter((n) => Number.isFinite(n) && n > 0)
+      .sort((a, b) => a - b);
+  };
+
+  const apiKeysExpiry = {
+    warnDays: parseApiKeyExpiryWarnDays(),
+    expiredWindowDays: parseInteger(
+      process.env.API_KEY_EXPIRED_WINDOW_DAYS,
+      DEFAULT_API_KEY_EXPIRED_WINDOW_DAYS,
+      0, null, 'API_KEY_EXPIRED_WINDOW_DAYS'
+    ),
+    headerWindowDays: parseInteger(
+      process.env.API_KEY_HEADER_WINDOW_DAYS,
+      DEFAULT_API_KEY_HEADER_WINDOW_DAYS,
+      0, null, 'API_KEY_HEADER_WINDOW_DAYS'
+    ),
+    webhookTimeoutMs: parseInteger(
+      process.env.API_KEY_WEBHOOK_TIMEOUT_MS,
+      DEFAULT_WEBHOOK_TIMEOUT_MS,
+      1000, null, 'API_KEY_WEBHOOK_TIMEOUT_MS'
+    ),
+  };
+
+  const apiKeys = {
+    legacy: process.env.API_KEYS
+      ? process.env.API_KEYS.split(',').map((key) => key.trim()).filter(Boolean)
+      : [],
+    expiry: apiKeysExpiry,
+  };
+
+  // Stellar transaction-sync scheduler configuration.
+  const stellarSync = {
+    intervalMs: parseInteger(
+      process.env.TX_SYNC_INTERVAL_MS,
+      DEFAULT_TX_SYNC_INTERVAL_MS,
+      MS_PER_MINUTE, null, 'TX_SYNC_INTERVAL_MS'
+    ),
+    leaseMultiplier: parseInteger(
+      process.env.TX_SYNC_LEASE_MULTIPLIER,
+      2, 1, 10, 'TX_SYNC_LEASE_MULTIPLIER'
+    ),
   };
 
   // Logging configuration
@@ -364,10 +465,14 @@ const buildConfig = (env, isProduction, isTest) => {
   const configObj = {
     server,
     stellar,
+    stellarSync,
     database,
     apiKeys,
     rateLimit,
     donations,
+    fees,
+    retention,
+    auditRetention,
     logging,
     encryption,
     geoBlocking,

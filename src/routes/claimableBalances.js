@@ -79,7 +79,10 @@ router.get(
       }
       // This assumes a listClaimableBalances(publicKey) method exists or is stubbed
       if (typeof stellarService.listClaimableBalances !== 'function') {
-        return res.status(501).json({ error: 'Listing claimable balances not implemented' });
+        // 503: the capability is not yet wired up on this server deployment.
+        // 501 would indicate the protocol will never support it; 503 accurately
+        // reflects "temporarily unavailable / not yet implemented in this build".
+        return res.status(503).json({ error: 'Listing claimable balances is not available on this server' });
       }
       const balances = await stellarService.listClaimableBalances(wallet.publicKey);
       res.status(200).json(balances);

@@ -13,8 +13,13 @@ const express = require('express');
 const router = express.Router();
 const serviceContainer = require('../config/serviceContainer');
 const asyncHandler = require('../utils/asyncHandler');
-
-const STROOPS_PER_XLM = 10_000_000;
+const config = require('../config');
+const {
+  STROOPS_PER_XLM,
+  STELLAR_BASE_FEE_STROOPS,
+  XLM_DECIMAL_PLACES,
+  FEE_EXAMPLE_AMOUNT_XLM,
+} = require('../constants');
 
 /** Map NetworkStatusService feeLevel → congestion label required by #794 */
 function mapCongestion(status) {
@@ -31,26 +36,27 @@ function mapCongestion(status) {
  * Returns application fee config + Stellar network base fee from cache.
  */
 router.get('/', asyncHandler(async (req, res) => {
-  const platformFeePercent = parseFloat(process.env.PLATFORM_FEE_PERCENT || '1.5');
-  const minimumFeeXLM     = parseFloat(process.env.MINIMUM_FEE_XLM     || '0.01');
-  const maximumFeeXLM     = parseFloat(process.env.MAXIMUM_FEE_XLM     || '10.00');
+  // All fee defaults come from src/config/index.js (single source of truth per concern).
+  const platformFeePercent = config.fees.platformPercent;
+  const minimumFeeXLM      = config.fees.minXLM;
+  const maximumFeeXLM      = config.fees.maxXLM;
 
   const networkStatus = serviceContainer.getNetworkStatusService().getStatus();
 
-  // Prefer the cached fee; fall back to Stellar baseline (100 stroops)
-  const baseFeeStroops = (networkStatus && networkStatus.feeStroops) || 100;
-  const baseFeeXLM     = parseFloat((baseFeeStroops / STROOPS_PER_XLM).toFixed(7));
+  // Prefer the cached fee; fall back to the Stellar baseline constant.
+  const baseFeeStroops = (networkStatus && networkStatus.feeStroops) || STELLAR_BASE_FEE_STROOPS;
+  const baseFeeXLM     = parseFloat((baseFeeStroops / STROOPS_PER_XLM).toFixed(XLM_DECIMAL_PLACES));
 
   const feeSource    = (networkStatus && networkStatus.connected) ? 'network_status_cache' : 'fallback_baseline';
   const lastUpdatedAt = (networkStatus && networkStatus.timestamp) || new Date().toISOString();
   const congestion   = mapCongestion(networkStatus);
 
-  // Example calculation for a 100 XLM donation
-  const exampleAmount   = 100.00;
-  const platformFee     = parseFloat(Math.max(exampleAmount * platformFeePercent / 100, minimumFeeXLM).toFixed(7));
-  const totalCost       = parseFloat((exampleAmount + platformFee + baseFeeXLM).toFixed(7));
+  // Worked example for the public endpoint.
+  const exampleAmount   = FEE_EXAMPLE_AMOUNT_XLM;
+  const platformFee     = parseFloat(Math.max(exampleAmount * platformFeePercent / 100, minimumFeeXLM).toFixed(XLM_DECIMAL_PLACES));
+  const totalCost       = parseFloat((exampleAmount + platformFee + baseFeeXLM).toFixed(XLM_DECIMAL_PLACES));
 
-  const minimumTotalFeeXLM = parseFloat((minimumFeeXLM + baseFeeXLM).toFixed(7));
+  const minimumTotalFeeXLM = parseFloat((minimumFeeXLM + baseFeeXLM).toFixed(XLM_DECIMAL_PLACES));
 
   res.json({
     application: {
