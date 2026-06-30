@@ -21,14 +21,20 @@ const crypto = require('crypto');
 const Database = require('../utils/database');
 const log = require('../utils/log');
 const timerRegistry = require('../utils/timerRegistry');
+const config = require('../config');
+const { MS_PER_DAY, DB_ESTIMATED_ROW_BYTES, DEFAULT_RETENTION_SCHEDULE } = require('../constants');
 
-/** Returns days from env var; 0 means disabled; negative/invalid falls back to default. */
-function parseDays(envVar, defaultDays) {
-  const raw = process.env[envVar];
-  if (raw === undefined || raw === '') return defaultDays;
-  const v = parseInt(raw, 10);
-  if (!Number.isFinite(v) || v < 0) return defaultDays;
-  return v;
+/**
+ * Reads the configured retention period (days) for a given category.
+ * Falls back to the unified default defined in config.retention.
+ */
+function resolveRetentionDays(category) {
+  switch (category) {
+    case 'donations': return config.retention.donationsDays;
+    case 'auditLogs': return config.retention.auditLogsDays;
+    case 'idempotency': return config.retention.idempotencyDays;
+    default: throw new Error(`Unknown retention category: ${category}`);
+  }
 }
 
 /**
@@ -47,12 +53,12 @@ function anonymize(value) {
  * @returns {string}
  */
 function cutoffDate(days) {
-  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  return new Date(Date.now() - days * MS_PER_DAY).toISOString();
 }
 
-/** Parse RETENTION_SCHEDULE_CRON="HH:MM" into [hour, minute]; default [2, 0]. */
+/** Parse RETENTION_SCHEDULE_CRON into [hour, minute]; default read from config.retention.scheduleCron. */
 function parseScheduleTime() {
-  const raw = process.env.RETENTION_SCHEDULE_CRON || '';
+  const raw = config.retention.scheduleCron || '';
   const match = raw.match(/^(\d{1,2}):(\d{2})$/);
   if (match) {
     const h = parseInt(match[1], 10);
@@ -65,6 +71,13 @@ function parseScheduleTime() {
     const m = parseInt(cronMatch[1], 10);
     const h = parseInt(cronMatch[2], 10);
     if (h >= 0 && h <= 23 && m >= 0 && m <= 59) return [h, m];
+  }
+  // Last resort: parse the canonical default from src/constants/domain.js.
+  const { DEFAULT_RETENTION_SCHEDULE } = require('../constants');
+  const fallback = typeof DEFAULT_RETENTION_SCHEDULE === 'string' ? DEFAULT_RETENTION_SCHEDULE : '02:00';
+  const fallbackMatch = fallback.match(/^(\d{1,2}):(\d{2})$/);
+  if (fallbackMatch) {
+    return [parseInt(fallbackMatch[1], 10), parseInt(fallbackMatch[2], 10)];
   }
   return [2, 0];
 }
@@ -85,7 +98,7 @@ class RetentionService {
    * @returns {Promise<{purged: number, remaining: number, durationMs: number}>}
    */
   async runDonationRetention(days) {
-    const retentionDays = days !== undefined ? days : parseDays('RETENTION_DONATIONS_DAYS', 2555);
+    const retentionDays = days !== undefined ? days : resolveRetentionDays('donations');
     if (retentionDays === 0) return { purged: 0, remaining: 0, durationMs: 0 };
 
     const start = Date.now();
@@ -122,7 +135,7 @@ class RetentionService {
    * @returns {Promise<{purged: number, remaining: number, durationMs: number}>}
    */
   async runAuditLogRetention(days) {
-    const retentionDays = days !== undefined ? days : parseDays('RETENTION_AUDIT_LOGS_DAYS', 365);
+    const retentionDays = days !== undefined ? days : resolveRetentionDays('auditLogs');
     if (retentionDays === 0) return { purged: 0, remaining: 0, durationMs: 0 };
 
     const start = Date.now();
@@ -151,7 +164,7 @@ class RetentionService {
    * @returns {Promise<{purged: number, remaining: number, durationMs: number}>}
    */
   async runIdempotencyRetention(days) {
-    const retentionDays = days !== undefined ? days : parseDays('RETENTION_IDEMPOTENCY_DAYS', 30);
+    const retentionDays = days !== undefined ? days : resolveRetentionDays('idempotency');
     if (retentionDays === 0) return { purged: 0, remaining: 0, durationMs: 0 };
 
     const start = Date.now();
@@ -199,9 +212,9 @@ class RetentionService {
    * @returns {Promise<Object>} Preview object with counts and size estimates
    */
   async preview() {
-    const donationDays = parseDays('RETENTION_DONATIONS_DAYS', 2555);
-    const auditLogDays = parseDays('RETENTION_AUDIT_LOGS_DAYS', 365);
-    const idempotencyDays = parseDays('RETENTION_IDEMPOTENCY_DAYS', 30);
+    const donationDays = resolveRetentionDays('donations');
+    const auditLogDays = resolveRetentionDays('auditLogs');
+    const idempotencyDays = resolveRetentionDays('idempotency');
 
     const donationCutoff = donationDays > 0 ? cutoffDate(donationDays) : null;
     const auditLogCutoff = auditLogDays > 0 ? cutoffDate(auditLogDays) : null;
@@ -228,10 +241,10 @@ class RetentionService {
         : { count: 0, oldestRecord: null, newestRecord: null },
     ]);
 
-    // Estimate sizes (rough approximation)
-    const estimateDonationSize = donationPreview.count * 500; // ~500 bytes per transaction
-    const estimateAuditLogSize = auditLogPreview.count * 1000; // ~1KB per audit log
-    const estimateIdempotencySize = idempotencyPreview.count * 200; // ~200 bytes per key
+    // Estimate sizes (rough approximation) — see DB_ESTIMATED_ROW_BYTES in src/constants/domain.js
+    const estimateDonationSize = donationPreview.count * DB_ESTIMATED_ROW_BYTES.DONATION;
+    const estimateAuditLogSize = auditLogPreview.count * DB_ESTIMATED_ROW_BYTES.AUDIT_LOG;
+    const estimateIdempotencySize = idempotencyPreview.count * DB_ESTIMATED_ROW_BYTES.IDEMPOTENCY_KEY;
 
     const totalEstimatedSize = estimateDonationSize + estimateAuditLogSize + estimateIdempotencySize;
 
@@ -266,12 +279,12 @@ class RetentionService {
    * @returns {Promise<Object>} Status object
    */
   async getStatus() {
-    const config = {
-      donationRetentionDays: parseDays('RETENTION_DONATIONS_DAYS', 2555),
-      auditLogRetentionDays: parseDays('RETENTION_AUDIT_LOGS_DAYS', 365),
-      idempotencyRetentionDays: parseDays('RETENTION_IDEMPOTENCY_DAYS', 30),
+    const retentionSnapshot = {
+      donationRetentionDays: resolveRetentionDays('donations'),
+      auditLogRetentionDays: resolveRetentionDays('auditLogs'),
+      idempotencyRetentionDays: resolveRetentionDays('idempotency'),
       dryRun: this.dryRun,
-      scheduleCron: process.env.RETENTION_SCHEDULE_CRON || '02:00',
+      scheduleCron: config.retention.scheduleCron,
     };
 
     const [txTotal, txAnon, auditTotal, idempotencyTotal] = await Promise.all([
@@ -313,6 +326,7 @@ class RetentionService {
     next.setUTCHours(h, m, 0, 0);
     if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
     const delay = next.getTime() - now.getTime();
+    log.debug('RETENTION_SERVICE', 'Scheduling next run', { delayMs: delay, hour: h, minute: m });
     this._timer = timerRegistry.createTimeout(() => {
       this.runAll().catch(err =>
         log.error('RETENTION_SERVICE', 'Scheduled run failed', { error: err.message })

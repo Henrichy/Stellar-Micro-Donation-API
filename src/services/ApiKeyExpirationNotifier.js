@@ -19,29 +19,31 @@ const http = require('http');
 const { URL } = require('url');
 const log = require('../utils/log');
 const db = require('../utils/database');
+const config = require('../config');
+const {
+  DEFAULT_HTTPS_PORT,
+  DEFAULT_HTTP_PORT,
+} = require('../constants');
 const {
   getKeysExpiringWithin,
   markExpiryNotificationSent,
   initializeApiKeysTable,
 } = require('../models/apiKeys');
 
-/** Notification thresholds in ascending order (smallest = most urgent).
+/** Notification thresholds (days before expiry) in ascending order (smallest = most urgent).
  *  Configurable via API_KEY_EXPIRY_WARN_DAYS env var (comma-separated, e.g. "30,7,1").
- *  Default: [1, 7, 30]
+ *  Sourced from config.apiKeys.expiry.warnDays (single source of truth).
  */
-function parseWarnDays() {
-  const raw = process.env.API_KEY_EXPIRY_WARN_DAYS;
-  if (!raw) return [1, 7, 30];
-  return raw.split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n) && n > 0).sort((a, b) => a - b);
-}
-
-const EXPIRY_THRESHOLDS_DAYS = parseWarnDays();
+const EXPIRY_THRESHOLDS_DAYS = config.apiKeys.expiry.warnDays;
 
 /** Window (days) within which we consider a key "just expired". */
-const EXPIRED_WINDOW_DAYS = 1;
+const EXPIRED_WINDOW_DAYS = config.apiKeys.expiry.expiredWindowDays;
 
 /** How many days before expiry to include the X-API-Key-Expires-In header. */
-const HEADER_WINDOW_DAYS = 30;
+const HEADER_WINDOW_DAYS = config.apiKeys.expiry.headerWindowDays;
+
+/** Outbound webhook timeout (ms). Sourced from config.apiKeys.expiry.webhookTimeoutMs. */
+const WEBHOOK_TIMEOUT_MS = config.apiKeys.expiry.webhookTimeoutMs;
 
 class ApiKeyExpirationNotifier {
   /**
@@ -121,7 +123,7 @@ class ApiKeyExpirationNotifier {
   async _getRecentlyExpiredKeys() {
     await initializeApiKeysTable();
     const now = Date.now();
-    const windowStart = now - EXPIRED_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+    const windowStart = now - EXPIRED_WINDOW_DAYS * require('../constants').MS_PER_DAY;
 
     const rows = await db.all(
       `SELECT id, name, key_prefix, expires_at, notification_email,
@@ -219,7 +221,7 @@ class ApiKeyExpirationNotifier {
       const transport = parsedUrl.protocol === 'https:' ? https : http;
       const options = {
         hostname: parsedUrl.hostname,
-        port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+        port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? DEFAULT_HTTPS_PORT : DEFAULT_HTTP_PORT),
         path: parsedUrl.pathname + parsedUrl.search,
         method: 'POST',
         headers: {
@@ -228,7 +230,7 @@ class ApiKeyExpirationNotifier {
           'User-Agent': 'Stellar-Donation-API/1.0',
           'X-Stellar-Event': event,
         },
-        timeout: 10000,
+        timeout: WEBHOOK_TIMEOUT_MS,
       };
 
       const req = transport.request(options, (res) => {

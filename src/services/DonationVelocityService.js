@@ -8,8 +8,14 @@
 
 const Database = require('../utils/database');
 const { AppError, NotFoundError, ERROR_CODES } = require('../utils/errors');
+const { DONATION_FREQUENCIES, MS_PER_DAY, MS_PER_WEEK, MONTHLY_WINDOW_DAY } = require('../constants');
 
-const WINDOW_TYPES = { daily: 'daily', weekly: 'weekly', monthly: 'monthly' };
+/** Allowed velocity-tracking window types — reuses the canonical donation frequencies. */
+const WINDOW_TYPES = Object.freeze({
+  DAILY: DONATION_FREQUENCIES.DAILY,
+  WEEKLY: DONATION_FREQUENCIES.WEEKLY,
+  MONTHLY: DONATION_FREQUENCIES.MONTHLY,
+});
 
 /**
  * Compute the window start timestamp for a given window type (UTC).
@@ -21,15 +27,15 @@ function getWindowStart(windowType, now = new Date()) {
   const d = new Date(now);
   d.setUTCHours(0, 0, 0, 0);
 
-  if (windowType === 'monthly') {
-    d.setUTCDate(1);
-  } else if (windowType === 'weekly') {
-    // Roll back to Monday
+  if (windowType === WINDOW_TYPES.MONTHLY) {
+    d.setUTCDate(MONTHLY_WINDOW_DAY);
+  } else if (windowType === WINDOW_TYPES.WEEKLY) {
+    // Roll back to Monday (UTC).
     const day = d.getUTCDay(); // 0=Sun
     const diff = day === 0 ? 6 : day - 1;
     d.setUTCDate(d.getUTCDate() - diff);
   }
-  // daily: already set to start of today
+  // daily: already set to start of today.
 
   return d.toISOString();
 }
@@ -42,11 +48,11 @@ function getWindowStart(windowType, now = new Date()) {
  */
 function getWindowEnd(windowType, now = new Date()) {
   const start = new Date(getWindowStart(windowType, now));
-  if (windowType === 'daily') {
-    return new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  if (windowType === WINDOW_TYPES.DAILY) {
+    return new Date(start.getTime() + MS_PER_DAY);
   }
-  if (windowType === 'weekly') {
-    return new Date(start.getTime() + 7 * 24 * 60 * 60 * 1000);
+  if (windowType === WINDOW_TYPES.WEEKLY) {
+    return new Date(start.getTime() + MS_PER_WEEK);
   }
   // monthly: first day of next month
   const next = new Date(start);
@@ -59,9 +65,9 @@ function getWindowEnd(windowType, now = new Date()) {
  * @param {number} recipientId
  * @param {{ maxAmount?: number, maxCount?: number, windowType?: string }} limits
  */
-async function setLimits(recipientId, { maxAmount, maxCount, windowType = 'daily' }) {
-  if (!WINDOW_TYPES[windowType]) {
-    const err = new Error(`Invalid windowType "${windowType}". Must be daily, weekly, or monthly.`);
+async function setLimits(recipientId, { maxAmount, maxCount, windowType = WINDOW_TYPES.DAILY }) {
+  if (!Object.values(WINDOW_TYPES).includes(windowType)) {
+    const err = new Error(`Invalid windowType "${windowType}". Must be one of ${Object.values(WINDOW_TYPES).join(', ')}.`);
     err.status = 400;
     throw err;
   }
@@ -106,7 +112,7 @@ async function checkVelocityLimits(donorId, recipientId, amount) {
   const limits = await getLimits(recipientId);
   if (!limits) return; // no limits configured
 
-  const windowType = limits.windowType || 'daily';
+  const windowType = limits.windowType || WINDOW_TYPES.DAILY;
   const windowStart = getWindowStart(windowType);
   const windowEnd = getWindowEnd(windowType);
 
@@ -154,7 +160,7 @@ async function checkVelocityLimits(donorId, recipientId, amount) {
  * @param {number} amount
  * @param {string} [windowType]
  */
-async function recordDonation(donorId, recipientId, amount, windowType = 'daily') {
+async function recordDonation(donorId, recipientId, amount, windowType = WINDOW_TYPES.DAILY) {
   const limits = await getLimits(recipientId);
   const wt = (limits && limits.windowType) || windowType;
   const windowStart = getWindowStart(wt);
@@ -178,7 +184,7 @@ async function recordDonation(donorId, recipientId, amount, windowType = 'daily'
  */
 async function getVelocityUsage(donorId, recipientId) {
   const limits = await getLimits(recipientId);
-  const windowType = (limits && limits.windowType) || 'daily';
+  const windowType = (limits && limits.windowType) || WINDOW_TYPES.DAILY;
   const windowStart = getWindowStart(windowType);
 
   const row = await Database.get(
