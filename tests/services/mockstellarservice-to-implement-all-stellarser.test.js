@@ -39,7 +39,7 @@ describe('MockStellarService interface compliance', () => {
 
   test('stroopsToXlm and xlmToStroops conversions should be consistent', () => {
     expect(service.stroopsToXlm('10000000')).toBe('1.0000000');
-    expect(service.xlmToStroops('2.5')).toBe('25000000');
+    expect(service.xlmToStroops('2.5')).toBe(25000000);
     expect(service.stroopsToXlm(service.xlmToStroops('3.1234567'))).toBe('3.1234567');
   });
 
@@ -76,7 +76,7 @@ describe('MockStellarService interface compliance', () => {
     await service.fundTestnetWallet(wallet.publicKey);
 
     const balances = await service.getAccountBalances(wallet.publicKey);
-    expect(balances.balances[0].balance).toBe('10000.0000000');
+    expect(balances[0].balance).toBe('10000.0000000');
 
     await expect(service.getAccountBalances('G' + 'A'.repeat(55))).rejects.toThrow('Account not found');
   });
@@ -156,7 +156,7 @@ describe('Bug Condition Exploration — Unimplemented Methods (Property 1)', () 
 
   // ── 1.3 buildPaymentTransaction ──────────────────────────────────────────────
   test('buildPaymentTransaction returns unsigned mock transaction (Req 1.3)', async () => {
-    const dst = 'GBBB2345678901234567890123456789012345678901234567890123';
+    const dst = 'G' + 'B'.repeat(55);
     const result = await service.buildPaymentTransaction(KNOWN_PUBLIC_KEY, dst, '10', {});
     expect(result._isMockTransaction).toBe(true);
     expect(result._unsigned).toBe(true);

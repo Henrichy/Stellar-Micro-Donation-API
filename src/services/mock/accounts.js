@@ -1,5 +1,4 @@
 const crypto = require('crypto');
-const StellarSdk = require('stellar-sdk');
 const { ValidationError, NotFoundError, BusinessLogicError, ERROR_CODES } = require('../../utils/errors');
 const log = require('../../utils/log');
 
@@ -233,14 +232,7 @@ class MockAccounts {
   }
 
   isValidAddress(address) {
-    // Mock is more lenient for testing - accepts any string starting with G, or valid Stellar keys
-    return (
-      typeof address === 'string' && 
-      (
-        /^G[A-Z2-7]{55}$/.test(address) || 
-        /^G[A-Z0-9]+$/.test(address)
-      )
-    );
+    return typeof address === 'string' && /^G[A-Z2-7]{55}$/.test(address);
   }
 
   async getHomeDomain(publicKey) {
