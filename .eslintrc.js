@@ -72,6 +72,7 @@ module.exports = {
     'no-implied-eval': 'error',
     'no-new-func': 'error',
     'no-console': 'off',
+    'local/require-async-handler': 'error',
   },
   overrides: [
     {

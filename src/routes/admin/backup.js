@@ -29,7 +29,7 @@ const CONFIRM_TOKEN_TTL_MS = 5 * 60 * 1000; // 5 minutes
  * Trigger an immediate encrypted database backup.
  * Returns: { backupId, path, sizeBytes, createdAt }
  */
-router.post('/backup', checkPermission(PERMISSIONS.ADMIN_ALL), async (req, res, next) => {
+router.post('/backup', checkPermission(PERMISSIONS.ADMIN_ALL), asyncHandler(async (req, res, next) => {
   try {
     const result = await backupService.backup();
     return res.status(201).json({
@@ -44,7 +44,7 @@ router.post('/backup', checkPermission(PERMISSIONS.ADMIN_ALL), async (req, res, 
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * GET /admin/backup/status
@@ -71,7 +71,7 @@ router.get('/status', checkPermission(PERMISSIONS.ADMIN_ALL), asyncHandler(async
  * GET /backups
  * List all available backup files with metadata.
  */
-router.get('/backups', checkPermission(PERMISSIONS.ADMIN_ALL), async (req, res, next) => {
+router.get('/backups', checkPermission(PERMISSIONS.ADMIN_ALL), asyncHandler(async (req, res, next) => {
   try {
     const backups = await backupService.listBackups();
     const shaped = backups.map((b) => ({
@@ -84,13 +84,13 @@ router.get('/backups', checkPermission(PERMISSIONS.ADMIN_ALL), async (req, res, 
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * GET /backups/:backupId/download
  * Stream the encrypted backup file to the client.
  */
-router.get('/backups/:backupId/download', checkPermission(PERMISSIONS.ADMIN_ALL), async (req, res, next) => {
+router.get('/backups/:backupId/download', checkPermission(PERMISSIONS.ADMIN_ALL), asyncHandler(async (req, res, next) => {
   try {
     const { backupId } = req.params;
 
@@ -117,14 +117,14 @@ router.get('/backups/:backupId/download', checkPermission(PERMISSIONS.ADMIN_ALL)
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * POST /backup/restore/:backupId/confirm
  * Generate a short-lived confirmation token required to initiate a restore.
  * Returns: { confirmationToken, expiresAt }
  */
-router.post('/backup/restore/:backupId/confirm', checkPermission(PERMISSIONS.ADMIN_ALL), async (req, res, next) => {
+router.post('/backup/restore/:backupId/confirm', checkPermission(PERMISSIONS.ADMIN_ALL), asyncHandler(async (req, res, next) => {
   try {
     const { backupId } = req.params;
 
@@ -148,7 +148,7 @@ router.post('/backup/restore/:backupId/confirm', checkPermission(PERMISSIONS.ADM
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * POST /backup/restore/:backupId
@@ -156,7 +156,7 @@ router.post('/backup/restore/:backupId/confirm', checkPermission(PERMISSIONS.ADM
  * Requires { confirmationToken } in the request body.
  * Returns HTTP 409 if there are active in-flight requests (excluding this one).
  */
-router.post('/backup/restore/:backupId', checkPermission(PERMISSIONS.ADMIN_ALL), async (req, res, next) => {
+router.post('/backup/restore/:backupId', checkPermission(PERMISSIONS.ADMIN_ALL), asyncHandler(async (req, res, next) => {
   try {
     const { backupId } = req.params;
     const { confirmationToken } = req.body || {};
@@ -207,6 +207,6 @@ router.post('/backup/restore/:backupId', checkPermission(PERMISSIONS.ADMIN_ALL),
     }
     next(err);
   }
-});
+}));
 
 module.exports = router;

@@ -14,6 +14,7 @@ const router = express.Router();
 const { requireAdmin } = require('../../middleware/rbac');
 const { createRateLimiter } = require('../../middleware/rateLimiter');
 const serviceContainer = require('../../config/serviceContainer');
+const asyncHandler = require('../../utils/asyncHandler');
 
 const systemInfoRateLimiter = process.env.NODE_ENV === 'test'
   ? (req, res, next) => next()
@@ -113,7 +114,7 @@ async function getFeatureFlags() {
   }
 }
 
-router.get('/', requireAdmin(), systemInfoRateLimiter, async (req, res, next) => {
+router.get('/', requireAdmin(), systemInfoRateLimiter, asyncHandler(async (req, res, next) => {
   try {
     const uptimeSeconds = Math.floor(process.uptime());
     const mem = process.memoryUsage();
@@ -155,6 +156,6 @@ router.get('/', requireAdmin(), systemInfoRateLimiter, async (req, res, next) =>
   } catch (err) {
     next(err);
   }
-});
+}));
 
 module.exports = router;

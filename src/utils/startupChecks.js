@@ -61,7 +61,7 @@ function checkEncryptionKey() {
   const trimmedKey = key.trim();
   
   if (trimmedKey.length !== 64) {
-    fail('ENCRYPTION_KEY', `must be exactly 64 hex characters (32 bytes), got ${trimmedKey.length} — run `npm run generate-key``);
+    fail('ENCRYPTION_KEY', `must be exactly 64 hex characters (32 bytes), got ${trimmedKey.length} — run 'npm run generate-key'`);
     return false;
   }
 
