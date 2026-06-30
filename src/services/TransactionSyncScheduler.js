@@ -15,9 +15,14 @@ const TransactionSyncService = require('./TransactionSyncService');
 const log = require('../utils/log');
 const timerRegistry = require('../utils/timerRegistry');
 const leaderElection = require('../utils/leaderElection');
+const config = require('../config');
 
-/** Default sync interval: 15 minutes */
-const DEFAULT_INTERVAL_MS = 15 * 60 * 1000;
+// Default sync interval is now sourced from config.stellarSync.intervalMs
+// (single source of truth — overrides via TX_SYNC_INTERVAL_MS env var).
+const DEFAULT_INTERVAL_MS = config.stellarSync.intervalMs;
+
+/** Lease TTL multiplier relative to the sync interval, sourced from config. */
+const LEASE_DURATION_MULTIPLIER = config.stellarSync.leaseMultiplier;
 
 class TransactionSyncScheduler {
   /**
@@ -27,9 +32,7 @@ class TransactionSyncScheduler {
    */
   constructor(stellarService, options = {}) {
     this.syncService = new TransactionSyncService(stellarService);
-    this.intervalMs = options.intervalMs
-      || parseInt(process.env.TX_SYNC_INTERVAL_MS, 10)
-      || DEFAULT_INTERVAL_MS;
+    this.intervalMs = options.intervalMs || DEFAULT_INTERVAL_MS;
     this.intervalId = null;
     this.isRunning = false;
 
@@ -103,7 +106,7 @@ class TransactionSyncScheduler {
   async _runSync() {
     const isLeader = await leaderElection.acquireLease(
       'tx_sync_scheduler',
-      this.intervalMs * 2
+      this.intervalMs * LEASE_DURATION_MULTIPLIER
     );
     if (!isLeader) {
       log.debug('TX_SYNC_SCHEDULER', 'Skipping sync tick — lease held by another instance', {

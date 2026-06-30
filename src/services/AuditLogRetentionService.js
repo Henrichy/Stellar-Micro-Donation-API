@@ -11,9 +11,19 @@
 const db = require('../utils/database');
 const log = require('../utils/log');
 const timerRegistry = require('../utils/timerRegistry');
+const config = require('../config');
+const { MS_PER_DAY, MS_PER_HOUR } = require('../constants');
 
-const RETENTION_DAYS = parseInt(process.env.AUDIT_LOG_RETENTION_DAYS || '90', 10);
-const DEFAULT_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+// Default schedule interval: 24h. Override via constructor option for tests.
+const DEFAULT_INTERVAL_MS = MS_PER_DAY;
+
+/**
+ * Resolve the configured audit-log retention days.
+ * Single source of truth lives in config.retention.auditLogsDays
+ * (defaults from src/constants/domain.js). The legacy AUDIT_LOG_RETENTION_DAYS
+ * env var is honoured as a fallback by the config loader.
+ */
+const RETENTION_DAYS = config.auditRetention.archiveAfterDays;
 
 class AuditLogRetentionService {
   constructor(intervalMs = DEFAULT_INTERVAL_MS) {
@@ -50,7 +60,7 @@ class AuditLogRetentionService {
   async runRetention(retentionDays = RETENTION_DAYS) {
     await this._ensureArchiveTable();
 
-    const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
+    const cutoff = new Date(Date.now() - retentionDays * MS_PER_DAY).toISOString();
 
     const rows = await db.all(
       `SELECT * FROM audit_logs WHERE timestamp < ?`,
@@ -92,7 +102,7 @@ class AuditLogRetentionService {
     this._timer.unref();
     log.info('AUDIT_RETENTION', 'Retention service started', {
       retentionDays: RETENTION_DAYS,
-      intervalHours: this.intervalMs / 3600000
+      intervalHours: this.intervalMs / MS_PER_HOUR,
     });
   }
 

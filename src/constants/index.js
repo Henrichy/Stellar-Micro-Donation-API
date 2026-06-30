@@ -1,12 +1,21 @@
 /**
  * Application Constants - Configuration Layer
- * 
+ *
  * RESPONSIBILITY: Centralized constant definitions for application-wide use
  * OWNER: Platform Team
  * DEPENDENCIES: None (foundational module)
- * 
+ *
  * Single source of truth for all shared constants including Stellar networks,
- * donation frequencies, transaction states, API key statuses, and validation limits.
+ * donation frequencies, transaction states, API key statuses, validation limits,
+ * time-unit conversions, network-level invariants, and domain defaults.
+ *
+ * Hierarchy:
+ *   - ./time      Pure time-unit conversions  (MS_PER_DAY, MS_PER_HOUR, ...)
+ *   - ./network   Network/protocol invariants (STROOPS_PER_XLM, default ports, ...)
+ *   - ./domain    Domain-level defaults      (retention windows, recipient priority, ...)
+ *   This file    Domain enums & SDK-oriented values (statuses, frequencies, enum lists).
+ *
+ * For env-overridable tunables, see ../config/.
  */
 
 /**
@@ -85,8 +94,19 @@ const HORIZON_URLS = Object.freeze({
 /**
  * Stellar amount precision: 1 XLM = 10,000,000 stroops
  * Use this constant to convert between XLM (user-facing) and stroops (storage).
+ * (Re-exported below from ./network for backwards compatibility — single source of truth.)
  */
-const STROOPS_PER_XLM = 10_000_000;
+
+// Re-exports from modular constant files. Keep `STROOPS_PER_XLM` accessible
+// at the top-level index for backwards compatibility with existing imports.
+const {
+  STROOPS_PER_XLM,
+  STELLAR_BASE_FEE_STROOPS,
+  XLM_DECIMAL_PLACES,
+  DEFAULT_HTTP_PORT,
+  DEFAULT_HTTPS_PORT,
+  DEFAULT_WEBHOOK_TIMEOUT_MS,
+} = require('./network');
 
 module.exports = {
   RESPONSE_STATUS,
@@ -98,4 +118,12 @@ module.exports = {
   VALID_STELLAR_NETWORKS,
   HORIZON_URLS,
   STROOPS_PER_XLM,
+  // New: network invariants
+  STELLAR_BASE_FEE_STROOPS,
+  XLM_DECIMAL_PLACES,
+  DEFAULT_HTTP_PORT,
+  DEFAULT_HTTPS_PORT,
+  DEFAULT_WEBHOOK_TIMEOUT_MS,
+  ...require('./time'),
+  ...require('./domain'),
 };
