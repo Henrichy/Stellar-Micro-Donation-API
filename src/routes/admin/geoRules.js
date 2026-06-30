@@ -23,6 +23,7 @@ const AuditLogService = require('../../services/AuditLogService');
 const log = require('../../utils/log');
 const { geoBlockMiddleware } = require('../../middleware/geoBlock');
 const { validateSchema } = require('../../middleware/schemaValidation');
+const asyncHandler = require('../../utils/asyncHandler');
 
 const updateGeoRuleSchema = validateSchema({
   body: {
@@ -53,7 +54,7 @@ const auth = [requireApiKey, requireAdmin()];
  * GET /admin/geo-rules
  * List all geo-blocking rules.
  */
-router.get('/', ...auth, async (req, res, next) => {
+router.get('/', ...auth, asyncHandler(async (req, res, next) => {
   try {
     const rules = await GeoRuleService.loadRules({ forceRefresh: true });
     const shaped = rules.map((r) => ({
@@ -68,14 +69,14 @@ router.get('/', ...auth, async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * POST /admin/geo-rules
  * Create a new geo-blocking rule.
  * Body: { countryCode: string, action: "block"|"allow", description?: string }
  */
-router.post('/', ...auth, async (req, res, next) => {
+router.post('/', ...auth, asyncHandler(async (req, res, next) => {
   try {
     const { countryCode, action, description } = req.body || {};
 
@@ -127,14 +128,14 @@ router.post('/', ...auth, async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * PATCH /admin/geo-rules/:id
  * Update a geo rule (toggle active, change description).
  * Body: { active?: boolean, description?: string }
  */
-router.patch('/:id', ...auth, updateGeoRuleSchema, async (req, res, next) => {
+router.patch('/:id', ...auth, updateGeoRuleSchema, asyncHandler(async (req, res, next) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) {
@@ -179,13 +180,13 @@ router.patch('/:id', ...auth, updateGeoRuleSchema, async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * DELETE /admin/geo-rules/:id
  * Remove a geo rule by ID.
  */
-router.delete('/:id', ...auth, async (req, res, next) => {
+router.delete('/:id', ...auth, asyncHandler(async (req, res, next) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) {
@@ -215,7 +216,7 @@ router.delete('/:id', ...auth, async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * POST /admin/geo-rules/test
@@ -223,7 +224,7 @@ router.delete('/:id', ...auth, async (req, res, next) => {
  * Body: { ip: string }
  * Returns: { allowed: boolean, country: string|null, countryName: string|null, matchedRule: Object|null, defaultAction: string }
  */
-router.post('/test', ...auth, async (req, res, next) => {
+router.post('/test', ...auth, asyncHandler(async (req, res, next) => {
   try {
     const ip = String(req.body?.ip || '').trim();
     if (!ip) {
@@ -279,7 +280,7 @@ router.post('/test', ...auth, async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * Check if IP is private/reserved (RFC 1918)
