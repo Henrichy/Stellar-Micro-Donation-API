@@ -17,6 +17,7 @@ const { requireAdmin } = require('../../middleware/rbac');
 const requireApiKey = require('../../middleware/apiKey');
 const { listApiKeys } = require('../../models/apiKeys');
 const { instance: usageService } = require('../../services/ApiKeyUsageService');
+const asyncHandler = require('../../utils/asyncHandler');
 
 const router = express.Router();
 
@@ -32,7 +33,7 @@ const DEFAULT_PAGE_SIZE = 20;
 /**
  * GET /admin/api-keys/usage
  */
-router.get('/', requireApiKey, requireAdmin(), async (req, res) => {
+router.get('/', requireApiKey, requireAdmin(), asyncHandler(async (req, res) => {
   try {
     const period = req.query.period || '24h';
     if (!PERIOD_MS[period]) {
@@ -157,8 +158,8 @@ router.get('/', requireApiKey, requireAdmin(), async (req, res) => {
       },
     });
   } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
+    throw err;
   }
-});
+}));
 
 module.exports = router;
